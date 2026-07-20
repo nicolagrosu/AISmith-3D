@@ -1,0 +1,928 @@
+{
+  "id": "a302d7ad-2c4d-4ff6-bea1-2c0db940b165",
+  "revision": 0,
+  "last_node_id": 20,
+  "last_link_id": 31,
+  "nodes": [
+    {
+      "id": 6,
+      "type": "SkinTokensGenerator",
+      "pos": [
+        -27.906524635241794,
+        -1608.8334966166508
+      ],
+      "size": [
+        378.3125,
+        503.03125
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "SKINTOKENS_MODEL",
+          "link": 6
+        },
+        {
+          "name": "input_mesh",
+          "type": "STRING",
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output_mesh_path",
+          "type": "STRING",
+          "links": [
+            22,
+            31
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-SkinTokens",
+        "ver": "f4ca7372398d19f205688d463da55829e9832182",
+        "Node name for S&R": "SkinTokensGenerator",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        5,
+        0.95,
+        1,
+        2,
+        10,
+        true,
+        true,
+        true,
+        true,
+        ".fbx",
+        "Headless (Blender)"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "SkinTokensLoadMesh",
+      "pos": [
+        -1040.2482605508671,
+        -2294.16361863717
+      ],
+      "size": [
+        716.625,
+        135.65625
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "mesh_path",
+          "type": "STRING",
+          "links": []
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-SkinTokens",
+        "ver": "f4ca7372398d19f205688d463da55829e9832182",
+        "Node name for S&R": "SkinTokensLoadMesh",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "/home/aero/comfy/ComfyUI/output/drgonnormal_rigged_1778502256.fbx"
+      ]
+    },
+    {
+      "id": 7,
+      "type": "SkinTokensModelLoader",
+      "pos": [
+        -1019.2228845769191,
+        -1748.3561672780052
+      ],
+      "size": [
+        668.78125,
+        169.84375
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "model",
+          "type": "SKINTOKENS_MODEL",
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-SkinTokens",
+        "ver": "f4ca7372398d19f205688d463da55829e9832182",
+        "Node name for S&R": "SkinTokensModelLoader",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "Load3D",
+      "pos": [
+        -1020.9046915572163,
+        -1463.5246298602442
+      ],
+      "size": [
+        883.375,
+        1287.5
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": null
+        },
+        {
+          "name": "mesh_path",
+          "type": "STRING",
+          "links": [
+            10
+          ]
+        },
+        {
+          "name": "normal",
+          "type": "IMAGE",
+          "links": null
+        },
+        {
+          "name": "camera_info",
+          "type": "LOAD3D_CAMERA",
+          "links": null
+        },
+        {
+          "name": "recording_video",
+          "type": "VIDEO",
+          "links": null
+        },
+        {
+          "name": "model_3d",
+          "type": "FILE_3D",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Resource Folder": "",
+        "cnr_id": "comfy-core",
+        "ver": "0.20.3",
+        "Node name for S&R": "Load3D",
+        "Camera Config": {
+          "cameraType": "perspective",
+          "fov": 75,
+          "state": {
+            "position": {
+              "x": 0.3269475933969519,
+              "y": 4.386643666504928,
+              "z": 3.725718146573231
+            },
+            "target": {
+              "x": 0.062261111101398356,
+              "y": 3.0688593337919343,
+              "z": -0.20017628629950934
+            },
+            "zoom": 1,
+            "cameraType": "perspective"
+          }
+        },
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "3d/man.glb",
+        null,
+        "uploadExtraResources",
+        "clear",
+        "",
+        1024,
+        1024
+      ]
+    },
+    {
+      "id": 10,
+      "type": "SkinTokensRigPreviewer",
+      "pos": [
+        491.10006285772283,
+        -1605.8933128302233
+      ],
+      "size": [
+        1175.28125,
+        1341.375
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "mesh_path",
+          "type": "STRING",
+          "link": 22
+        }
+      ],
+      "outputs": [
+        {
+          "name": "mesh_path",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-SkinTokens",
+        "ver": "f4ca7372398d19f205688d463da55829e9832182",
+        "Node name for S&R": "SkinTokensRigPreviewer",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        ""
+      ]
+    },
+    {
+      "id": 11,
+      "type": "HYMotionSaveNPZ",
+      "pos": [
+        3435.673229396428,
+        -1407.810249081603
+      ],
+      "size": [
+        270,
+        144
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "motion_data",
+          "type": "HYMOTION_DATA",
+          "link": 23
+        }
+      ],
+      "outputs": [
+        {
+          "name": "npz_paths",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-HyMotion",
+        "ver": "b19a9ff52e0a2855b46dc7fcae23e38cb41edae7",
+        "Node name for S&R": "HYMotionSaveNPZ",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        },
+        "aux_id": "Aero-Ex/ComfyUI-HyMotion"
+      },
+      "widgets_values": [
+        "hymotion_npz",
+        "motion"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "VRAMCleanup",
+      "pos": [
+        2432.008340379094,
+        -1083.1261162697408
+      ],
+      "size": [
+        270,
+        128
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "shape": 7,
+          "type": "*",
+          "link": 24
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": [
+            30
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui_memory_cleanup",
+        "ver": "1.1.2",
+        "Node name for S&R": "VRAMCleanup",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        true,
+        true
+      ]
+    },
+    {
+      "id": 13,
+      "type": "RAMCleanup",
+      "pos": [
+        2394.658460141659,
+        -897.8541676795223
+      ],
+      "size": [
+        270,
+        188
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "anything",
+          "shape": 7,
+          "type": "*",
+          "link": 31
+        }
+      ],
+      "outputs": [
+        {
+          "name": "output",
+          "type": "*",
+          "links": [
+            24
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui_memory_cleanup",
+        "ver": "1.1.2",
+        "Node name for S&R": "RAMCleanup",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        true,
+        true,
+        true,
+        3
+      ]
+    },
+    {
+      "id": 14,
+      "type": "MarkdownNote",
+      "pos": [
+        1867.4362924942623,
+        -1791.4857176257296
+      ],
+      "size": [
+        476,
+        970.6875
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Model LInks",
+      "properties": {
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        }
+      },
+      "widgets_values": [
+        "# **HY-MOTION 1.0 – COMFYUI MODEL SETUP**\n\n---\n\n# **1. CORE MODELS**\n\n## **HY-MOTION-1.0 (FULL)**\n### **[DOWNLOAD LATEST.CKPT HERE](https://huggingface.co/SumitMathur8956/Hy-Motion1.0/resolve/main/hymotion/HY-Motion-1.0/latest.ckpt)**\n> **SAVE TO: `ComfyUI/models/hymotion/HY-Motion-1.0`**\n\n---\n\n## **HY-MOTION-1.0-LITE**\n### **[DOWNLOAD LATEST.CKPT HERE](https://huggingface.co/SumitMathur8956/Hy-Motion1.0/resolve/main/hymotion/HY-Motion-1.0-Lite/latest.ckpt)**\n> **SAVE TO: `ComfyUI/models/hymotion/HY-Motion-1.0-Lite`**\n\n---\n\n# **2. TEXT ENCODERS**\n**ALL FILES BELOW GO TO: `ComfyUI/models/text_encoders`**\n\n## **VIT-CLIP TEXT ENCODER**\n### **[DOWNLOAD SAFETENSORS](https://huggingface.co/SumitMathur8956/Hy-Motion1.0/resolve/main/text_encoders/clip-vit-large-patch14.safetensors)**\n\n## **QWEN3-8B (FP8)**\n### **[DOWNLOAD SAFETENSORS](https://huggingface.co/SumitMathur8956/Hy-Motion1.0/resolve/main/text_encoders/Qwen3-8B_fp8.safetensors)**\n\n## **QWEN3-8B (GGUF)**\n### **[BROWSE GGUF FILES HERE](https://huggingface.co/SumitMathur8956/Hy-Motion1.0/tree/main/text_encoders/Qwen3-8B-GGUF)**"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 15,
+      "type": "HYMotionDiTLoader",
+      "pos": [
+        3426.0527137188537,
+        -1630.3354022745098
+      ],
+      "size": [
+        324.0625,
+        141.3125
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "dit_model",
+          "type": "HYMOTION_DIT",
+          "links": [
+            25
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-HY-Motion1",
+        "ver": "a588e907c22100ab0a14b83fef27ca42965914f3",
+        "Node name for S&R": "HYMotionDiTLoader",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        },
+        "aux_id": "Aero-Ex/ComfyUI-HyMotion"
+      },
+      "widgets_values": [
+        "HY-Motion-1.0-Lite",
+        "cuda"
+      ],
+      "color": "#009933"
+    },
+    {
+      "id": 16,
+      "type": "HYMotionTextEncoderLoader",
+      "pos": [
+        2416.4834779288376,
+        -1687.5210131995213
+      ],
+      "size": [
+        360.21875,
+        175.96875
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "text_encoder",
+          "type": "HYMOTION_TEXT_ENCODER",
+          "links": [
+            27
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-HY-Motion1",
+        "ver": "a588e907c22100ab0a14b83fef27ca42965914f3",
+        "Node name for S&R": "HYMotionTextEncoderLoader",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        },
+        "aux_id": "Aero-Ex/ComfyUI-HyMotion"
+      },
+      "widgets_values": [
+        "clip-vit-large-patch14.safetensors",
+        "Qwen3-8B-Q8_0.gguf",
+        "cpu"
+      ],
+      "color": "#009933"
+    },
+    {
+      "id": 17,
+      "type": "HYMotionSampler",
+      "pos": [
+        2918.565123995204,
+        -1683.1872281319875
+      ],
+      "size": [
+        389.0625,
+        882.46875
+      ],
+      "flags": {
+        "collapsed": false
+      },
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "dit_model",
+          "type": "HYMOTION_DIT",
+          "link": 25
+        },
+        {
+          "name": "text_embeds",
+          "type": "HYMOTION_TEXT_EMBEDS",
+          "link": 26
+        },
+        {
+          "name": "motion_data",
+          "shape": 7,
+          "type": "HYMOTION_DATA",
+          "link": null
+        },
+        {
+          "name": "first_frame",
+          "shape": 7,
+          "type": "HYMOTION_FRAME",
+          "link": null
+        },
+        {
+          "name": "latent",
+          "shape": 7,
+          "type": "LATENT",
+          "link": null
+        },
+        {
+          "name": "last_frame",
+          "shape": 7,
+          "type": "HYMOTION_FRAME",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "motion_data",
+          "type": "HYMOTION_DATA",
+          "links": [
+            23,
+            29
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-HY-Motion1",
+        "ver": "a588e907c22100ab0a14b83fef27ca42965914f3",
+        "Node name for S&R": "HYMotionSampler",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        },
+        "aux_id": "Aero-Ex/ComfyUI-HyMotion"
+      },
+      "widgets_values": [
+        12,
+        318906172991876,
+        "fixed",
+        5,
+        1,
+        100,
+        true,
+        0,
+        false,
+        "euler",
+        0.0001,
+        0.0001,
+        true,
+        0,
+        false,
+        48,
+        1,
+        5,
+        1,
+        11,
+        false,
+        0.7
+      ],
+      "color": "#009933"
+    },
+    {
+      "id": 18,
+      "type": "HYMotionTextEncode",
+      "pos": [
+        2407.9641842382716,
+        -1393.393134603118
+      ],
+      "size": [
+        400,
+        230
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "text_encoder",
+          "type": "HYMOTION_TEXT_ENCODER",
+          "link": 27
+        }
+      ],
+      "outputs": [
+        {
+          "name": "text_embeds",
+          "type": "HYMOTION_TEXT_EMBEDS",
+          "links": [
+            26
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-HY-Motion1",
+        "ver": "a588e907c22100ab0a14b83fef27ca42965914f3",
+        "Node name for S&R": "HYMotionTextEncode",
+        "ue_properties": {
+          "widget_ue_connectable": {},
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        },
+        "aux_id": "Aero-Ex/ComfyUI-HyMotion"
+      },
+      "widgets_values": [
+        "A person is running"
+      ],
+      "color": "#009933"
+    },
+    {
+      "id": 19,
+      "type": "HYMotionFBXPlayer",
+      "pos": [
+        3845.0151683633685,
+        -1773.3289862273318
+      ],
+      "size": [
+        1880.84375,
+        1777.46875
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "fbx_path",
+          "shape": 7,
+          "type": "STRING",
+          "widget": {
+            "name": "fbx_path"
+          },
+          "link": 28
+        }
+      ],
+      "outputs": [
+        {
+          "name": "fbx_path",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-HyMotion",
+        "ver": "a7dd59cf3c960745d2da49ae58eb4c80c417e882",
+        "Node name for S&R": "HYMotionFBXPlayer",
+        "ue_properties": {
+          "widget_ue_connectable": {
+            "fbx_path": true
+          },
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        },
+        "aux_id": "Aero-Ex/ComfyUI-HyMotion"
+      },
+      "widgets_values": [
+        "none",
+        "",
+        ""
+      ]
+    },
+    {
+      "id": 20,
+      "type": "HYMotionRetargetFBX",
+      "pos": [
+        3424.5936249394845,
+        -1165.8807631473815
+      ],
+      "size": [
+        382.125,
+        534.65625
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "motion_data",
+          "type": "HYMOTION_DATA",
+          "link": 29
+        },
+        {
+          "name": "target_fbx",
+          "type": "STRING",
+          "widget": {
+            "name": "target_fbx"
+          },
+          "link": 30
+        }
+      ],
+      "outputs": [
+        {
+          "name": "fbx_path",
+          "type": "STRING",
+          "links": [
+            28
+          ]
+        },
+        {
+          "name": "fbx",
+          "type": "FBX",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-HyMotion",
+        "ver": "b19a9ff52e0a2855b46dc7fcae23e38cb41edae7",
+        "Node name for S&R": "HYMotionRetargetFBX",
+        "ue_properties": {
+          "widget_ue_connectable": {
+            "target_fbx": true
+          },
+          "version": "7.7",
+          "input_ue_unconnectable": {}
+        },
+        "aux_id": "Aero-Ex/ComfyUI-HyMotion"
+      },
+      "widgets_values": [
+        "",
+        "mychar",
+        "hello",
+        0,
+        true,
+        0,
+        false,
+        true,
+        false,
+        false,
+        false,
+        false,
+        30,
+        "T-Pose"
+      ]
+    }
+  ],
+  "links": [
+    [
+      6,
+      7,
+      0,
+      6,
+      0,
+      "SKINTOKENS_MODEL"
+    ],
+    [
+      10,
+      9,
+      2,
+      6,
+      1,
+      "STRING"
+    ],
+    [
+      22,
+      6,
+      0,
+      10,
+      0,
+      "STRING"
+    ],
+    [
+      23,
+      17,
+      0,
+      11,
+      0,
+      "HYMOTION_DATA"
+    ],
+    [
+      24,
+      13,
+      0,
+      12,
+      0,
+      "*"
+    ],
+    [
+      25,
+      15,
+      0,
+      17,
+      0,
+      "HYMOTION_DIT"
+    ],
+    [
+      26,
+      18,
+      0,
+      17,
+      1,
+      "HYMOTION_TEXT_EMBEDS"
+    ],
+    [
+      27,
+      16,
+      0,
+      18,
+      0,
+      "HYMOTION_TEXT_ENCODER"
+    ],
+    [
+      28,
+      20,
+      0,
+      19,
+      0,
+      "STRING"
+    ],
+    [
+      29,
+      17,
+      0,
+      20,
+      0,
+      "HYMOTION_DATA"
+    ],
+    [
+      30,
+      12,
+      0,
+      20,
+      1,
+      "STRING"
+    ],
+    [
+      31,
+      6,
+      0,
+      13,
+      0,
+      "STRING"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Animation",
+      "bounding": [
+        1771.6193173890222,
+        -1920.8703183421621,
+        4137.633204633621,
+        2057.6560796703375
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.44237965539383095,
+      "offset": [
+        1679.3941350559644,
+        2558.479665119413
+      ]
+    },
+    "frontendVersion": "1.42.15",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true,
+    "ue_links": [],
+    "links_added_by_ue": []
+  },
+  "version": 0.4
+}

@@ -1,0 +1,134 @@
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Activity, Box, Brush, ChevronRight, CircleHelp, Download, Film, FolderOpen, Gauge, ImagePlus, Layers3, LoaderCircle, MemoryStick, Paintbrush, Play, RefreshCw, RotateCcw, ScanLine, Scissors, Settings2, Sparkles, Upload, UserRound, X } from 'lucide-react'
+import StudioViewport from './StudioViewport'
+
+const API = 'http://127.0.0.1:8000/api'
+type Tab = 'generate' | 'retopologize' | 'rig' | 'paint' | 'animate'
+type Artifact = { id: string; name: string; kind: string; size_bytes: number; metadata?: Record<string, unknown> }
+type Capabilities = { gpu: { available: boolean; name: string; vram_total_mb: number; vram_used_mb: number; cuda: boolean; torch_cuda_available?: boolean; native_inference_ready?: boolean; model_variant: string; recommended_resolution: number }; blender: { available: boolean }; models: Record<string, boolean>; diagnostics?: string[]; memory: { loaded_model: string | null }; output_directory?: string }
+type Job = { id: string; kind: string; status: string; progress: number; message: string; logs: string[]; warnings: string[]; output_artifact_id?: string | null; error?: string | null }
+type DownloadState = { id: string; model: string; status: string; progress: number; message: string; logs: string[]; error?: string | null; file_name?: string | null; file_index?: number; file_count?: number; file_bytes?: number; file_total_bytes?: number }
+type PaintStroke = { x: number; y: number; radius: number; color: string; opacity: number; hardness: number }
+
+const tabs: { id: Tab; label: string; icon: typeof Sparkles; kicker: string }[] = [
+  { id: 'generate', label: 'Generate', icon: Sparkles, kicker: 'Image to 3D' },
+  { id: 'retopologize', label: 'Retopologize', icon: ScanLine, kicker: 'Clean topology' },
+  { id: 'rig', label: 'Auto Rig', icon: UserRound, kicker: 'Game-ready bones' },
+  { id: 'paint', label: 'Texture Paint', icon: Paintbrush, kicker: 'Material studio' },
+  { id: 'animate', label: 'Animate', icon: Film, kicker: 'Motion library' },
+]
+
+async function json<T>(url: string, init?: RequestInit): Promise<T> { const res = await fetch(`${API}${url}`, init); if (!res.ok) { const body = await res.json().catch(() => ({})); throw new Error(body.detail || `Request failed (${res.status})`) }; return res.json() }
+async function upload(file: File): Promise<Artifact> { const form = new FormData(); form.append('file', file); return json<Artifact>('/assets/upload', { method: 'POST', body: form }) }
+
+function formatMb(mb: number) { return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB` }
+
+export default function App() {
+  const [tab, setTab] = useState<Tab>('generate')
+  const [caps, setCaps] = useState<Capabilities | null>(null)
+  const [source, setSource] = useState<Artifact | null>(null)
+  const [output, setOutput] = useState<Artifact | null>(null)
+  const [job, setJob] = useState<Job | null>(null)
+  // Default to 1024 (Fine mode); 512 maps to Coarse mode.
+  const [resolution, setResolution] = useState<512 | 768 | 1024>(1024)
+  const [targetFaces, setTargetFaces] = useState(10000)
+  const [quality, setQuality] = useState<'game' | 'balanced' | 'high'>('game')
+  const [animation, setAnimation] = useState('Idle')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [paintColor, setPaintColor] = useState('#7c5cff')
+  const [roughness, setRoughness] = useState(42)
+  const [metallic, setMetallic] = useState(18)
+  const [paintStrokes, setPaintStrokes] = useState<PaintStroke[]>([])
+  const [brushSize, setBrushSize] = useState(9)
+  const [brushOpacity, setBrushOpacity] = useState(90)
+  const [brushHardness, setBrushHardness] = useState(80)
+  const [downloads, setDownloads] = useState<DownloadState[]>([])
+  const fileRef = useRef<HTMLInputElement>(null)
+  const modelFileRef = useRef<HTMLInputElement>(null)
+ 
+  const refreshCaps = () => json<Capabilities>('/system/capabilities').then(setCaps).catch(() => setError('Start the Python worker on port 8000 to connect the local studio.'))
+  useEffect(() => { refreshCaps(); const timer = window.setInterval(refreshCaps, 5000); return () => window.clearInterval(timer) }, [])
+  useEffect(() => { const active = downloads.filter((item) => ['queued', 'running'].includes(item.status)); if (!active.length) return; const timer = window.setInterval(() => { Promise.all(active.map((item) => json<DownloadState>(`/downloads/${item.id}`))).then((fresh) => { setDownloads((current) => current.map((item) => fresh.find((next) => next.id === item.id) || item)); if (fresh.some((item) => item.status === 'completed')) refreshCaps() }).catch(() => undefined) }, 700); return () => window.clearInterval(timer) }, [downloads])
+  useEffect(() => { if (!job || !['queued', 'running'].includes(job.status)) return; const timer = window.setInterval(() => json<Job>(`/jobs/${job.id}`).then(setJob).catch(() => undefined), 500); return () => window.clearInterval(timer) }, [job])
+  useEffect(() => { if (job?.status === 'completed' && job.output_artifact_id) { json<Artifact>(`/assets/${job.output_artifact_id}/download`, { method: 'HEAD' }).catch(() => undefined); setOutput({ id: job.output_artifact_id, name: `${job.kind} result.glb`, kind: 'glb', size_bytes: 0 }) } }, [job?.status])
+ 
+  const gpuPercent = useMemo(() => caps?.gpu.vram_total_mb ? Math.min(100, (caps.gpu.vram_used_mb / caps.gpu.vram_total_mb) * 100) : 0, [caps])
+  const activeTab = tabs.find((item) => item.id === tab)!
+  const activeSource = tab === 'generate' ? source : output || source
+  const displayAsset = output || source
+  const nativeConfigured = Boolean(caps?.models.trellis2_native && caps?.models.skintoken_native)
+  const requiredDownload = useMemo(() => {
+    if (!caps || tab === 'paint' || tab === 'retopologize' || tab === 'animate') return null
+    if (tab === 'generate') {
+      return { name: 'trellis2', label: 'Trellis2 GGUF C++ models', ready: Boolean(caps.models.trellis_gguf_ready), detail: 'Downloads the direct C++ f16 pipeline GGUF models.' }
+    }
+    return { name: 'skintoken', label: 'SkinToken checkpoints', ready: Boolean(caps.models.skintoken_ready), detail: 'Downloads the rigging checkpoint, VAE, and required tokenizer configuration.' }
+  }, [caps, tab])
+
+  const chooseFile = async (file: File | undefined, target: 'input' | 'model' = 'input') => { if (!file) return; setError(''); try { const artifact = await upload(file); if (target === 'input' && tab === 'generate') { setSource(artifact); setOutput(null) } else setOutput(artifact) } catch (e) { setError(e instanceof Error ? e.message : 'Upload failed') } }
+  const runJob = async () => {
+    setError(''); setBusy(true)
+    try {
+      const kind = tab === 'paint' ? 'paint-bake' : tab
+      const created = await json<Job>('/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind, source_artifact_id: activeSource?.id, resolution, target_faces: targetFaces, quality, animation, settings: { color: paintColor, roughness, metallic, strokes: paintStrokes } }) })
+      setJob(created)
+    } catch (e) { setError(e instanceof Error ? e.message : 'Could not start job') } finally { setBusy(false) }
+  }
+  const clearMemory = async () => { try { await json('/system/clear-memory', { method: 'POST' }); refreshCaps() } catch (e) { setError(e instanceof Error ? e.message : 'Memory cleanup failed') } }
+  const openLocation = async () => { if (displayAsset) await json(`/assets/${displayAsset.id}/open-location`, { method: 'POST' }).catch((e) => setError(e.message)) }
+  const chooseOutputLocation = async () => { try { await json('/system/output-location/select', { method: 'POST' }); refreshCaps() } catch (e) { setError(e instanceof Error ? e.message : 'Could not choose output location') } }
+  const startDownload = async () => { if (!requiredDownload || requiredDownload.ready) return; setError(''); try { const state = await json<DownloadState>(`/models/${requiredDownload.name}/download`, { method: 'POST' }); setDownloads((current) => current.some((item) => item.id === state.id) ? current : [...current, state]) } catch (e) { setError(e instanceof Error ? e.message : 'Could not start model download') } }
+
+  return <div className="app-shell">
+    <header className="topbar">
+      <div className="brand"><div className="brand-mark"><Box size={19} /></div><div><strong>AISMITH 3D</strong><span>LOCAL 3D STUDIO</span></div></div>
+      <div className="top-tabs">{tabs.map(({ id, label, icon: Icon }) => <button className={`top-tab ${tab === id ? 'active' : ''}`} onClick={() => setTab(id)} key={id}><Icon size={15} />{label}</button>)}</div>
+      <div className="top-actions"><div className="connection"><span className={`status-dot ${caps ? 'on' : ''}`} /> {caps ? 'Local worker ready' : 'Connecting'}</div><button className="icon-button" title="Help"><CircleHelp size={17} /></button><button className="avatar">AK</button></div>
+    </header>
+    <div className="subbar"><div className="crumb"><span className="crumb-muted">Workspace</span><ChevronRight size={13} /><span>{activeTab.label}</span>{displayAsset && <><ChevronRight size={13} /><span className="crumb-muted">{displayAsset.name}</span></>}</div><div className="subbar-right"><div className="memory"><MemoryStick size={14} /><span>VRAM</span><strong>{caps ? `${formatMb(caps.gpu.vram_used_mb)} / ${formatMb(caps.gpu.vram_total_mb)}` : '—'}</strong><div className="memory-track"><i className={gpuPercent > 80 ? 'danger' : gpuPercent > 55 ? 'warn' : ''} style={{ width: `${Math.max(5, gpuPercent)}%` }} /></div></div><button className="quiet-button" onClick={clearMemory}><RefreshCw size={13} /> Clear memory</button></div></div>
+    <main className="workspace">
+      <aside className="control-panel">
+        <div className="panel-heading"><div><div className="eyebrow">{activeTab.kicker}</div><h1>{activeTab.label}</h1></div><button className="icon-button"><Settings2 size={17} /></button></div>
+        {requiredDownload && <ModelRequirement requirement={requiredDownload} onDownload={startDownload} downloading={downloads.some((item) => item.model === requiredDownload.name && ['queued', 'running'].includes(item.status))} loaded={caps?.memory.loaded_model === requiredDownload.name} />}
+        <div className="panel-scroll">
+          {tab === 'generate' && <GenerateControls resolution={resolution} setResolution={setResolution} caps={caps} source={source} outputDirectory={caps?.output_directory} onChooseOutput={chooseOutputLocation} onUpload={() => fileRef.current?.click()} />}
+        {tab === 'retopologize' && <RetopoControls targetFaces={targetFaces} setTargetFaces={setTargetFaces} quality={quality} setQuality={setQuality} source={activeSource} onUpload={() => fileRef.current?.click()} />}
+        {tab === 'rig' && <RigControls source={activeSource} onUpload={() => fileRef.current?.click()} blender={caps?.blender.available} />}
+        {tab === 'paint' && <PaintControls color={paintColor} setColor={setPaintColor} roughness={roughness} setRoughness={setRoughness} metallic={metallic} setMetallic={setMetallic} brushSize={brushSize} setBrushSize={setBrushSize} brushOpacity={brushOpacity} setBrushOpacity={setBrushOpacity} brushHardness={brushHardness} setBrushHardness={setBrushHardness} strokes={paintStrokes} setStrokes={setPaintStrokes} source={activeSource} onUpload={() => fileRef.current?.click()} />}
+        {tab === 'animate' && <AnimateControls animation={animation} setAnimation={setAnimation} source={activeSource} onUpload={() => fileRef.current?.click()} />}
+          <input ref={fileRef} type="file" hidden accept={tab === 'generate' ? 'image/png,image/jpeg,image/webp' : '.glb,.gltf,.fbx,.obj'} onChange={(e) => chooseFile(e.target.files?.[0], 'input')} />
+          <input ref={modelFileRef} type="file" hidden accept=".glb,model/gltf-binary" onChange={(e) => chooseFile(e.target.files?.[0], 'model')} />
+        </div>
+        <div className="panel-footer">
+        {error && <div className="error-box"><X size={14} />{error}</div>}
+        {!error && caps?.diagnostics?.[0] && <div className="info-line"><Settings2 size={14} /> {caps.diagnostics[0]}</div>}
+        <button className="primary-action" onClick={runJob} disabled={busy || !activeSource}>{busy ? <LoaderCircle className="spin" size={17} /> : <Play size={17} fill="currentColor" />}{busy ? 'Starting…' : tab === 'generate' ? 'Generate 3D asset' : `Run ${activeTab.label}`}</button>
+        {job && <div className={`job-status ${job.status}`}><div className="job-line"><Activity size={14} /><span>{job.message}</span><strong>{job.progress}%</strong></div><div className="job-track"><i style={{ width: `${job.progress}%` }} /></div>{job.warnings?.[0] && <small>{job.warnings[0]}</small>}</div>}
+        </div>
+      </aside>
+      <section className="canvas-area"><StudioViewport artifactId={displayAsset?.id} artifactKind={displayAsset?.kind} artifactName={displayAsset?.name} onImportModel={() => modelFileRef.current?.click()} /><div className="canvas-footer"><div><span className="eyebrow">CURRENT OUTPUT</span><strong>{displayAsset ? displayAsset.name : 'No asset loaded'}</strong></div>{displayAsset && <div className="footer-actions"><button className="secondary-button" onClick={openLocation}><FolderOpen size={14} /> Open location</button>{displayAsset.kind === 'glb' && <a className="download-button" href={`${API}/assets/${displayAsset.id}/download`}><Download size={14} /> Export GLB</a>}</div>}</div></section>
+      <aside className="inspector"><div className="inspector-tabs"><button className="selected">Asset</button><button>Scene</button><button>Details</button></div><div className="inspector-body"><div className="asset-icon"><Box size={23} /></div><h2>{displayAsset ? displayAsset.name.replace('.glb', '') : 'Untitled asset'}</h2><p className="muted">{displayAsset ? 'Artifact handoff ready' : 'Upload an image or model to begin'}</p><div className="spec-grid"><div><span>Vertices</span><strong>{displayAsset ? '—' : '0'}</strong></div><div><span>Triangles</span><strong>{displayAsset ? '—' : '0'}</strong></div><div><span>Materials</span><strong>{displayAsset ? '1' : '0'}</strong></div><div><span>Format</span><strong>{displayAsset ? 'GLB' : '—'}</strong></div></div><div className="handoff"><div className="eyebrow">PIPELINE HANDOFF</div>{tabs.map((item, index) => <div className={`handoff-row ${item.id === tab ? 'current' : ''}`} key={item.id}><span className={`handoff-number ${index <= tabs.findIndex((x) => x.id === tab) && displayAsset ? 'done' : ''}`}>{index + 1}</span><span>{item.label}</span>{item.id === tab ? <span className="current-label">Current</span> : item.id !== 'generate' && displayAsset ? <span className="ready-label">Ready</span> : null}</div>)}</div></div></aside>
+    </main>
+    <DownloadDock downloads={downloads} />
+  </div>
+}
+
+function ModelRequirement({ requirement, onDownload, downloading, loaded }: { requirement: { name: string; label: string; ready: boolean; detail: string }; onDownload: () => void; downloading: boolean; loaded: boolean }) { const state = downloading ? 'Downloading' : loaded ? 'Loaded in VRAM' : requirement.ready ? 'Available locally' : 'Required'; return <div className={`model-requirement ${requirement.ready ? 'ready' : ''}`}><div className="requirement-top"><div><div className="eyebrow">MODEL STATUS</div><strong>{requirement.label}</strong></div><span className="requirement-state">{state}</span></div><p>{requirement.ready ? 'Complete workflow model bundle verified in the local cache. It is loaded only while a job is running.' : requirement.detail}</p>{!requirement.ready && <button className="download-model-button" onClick={onDownload} disabled={downloading}><Download size={14} /> {downloading ? 'Download running…' : 'Download full workflow bundle'}</button>}</div> }
+function DownloadDock({ downloads }: { downloads: DownloadState[] }) { const visible = downloads.filter((item) => ['queued', 'running', 'completed', 'failed'].includes(item.status)); if (!visible.length) return null; return <div className="download-dock"><div className="download-dock-title"><Download size={14} /><strong>Local downloads</strong><span>{visible.filter((item) => ['queued', 'running'].includes(item.status)).length || ' '}</span></div>{visible.slice(-3).map((item) => { const hasFile = Boolean(item.file_name); const fileProgress = item.file_total_bytes ? `${formatMb((item.file_bytes || 0) / 1024 / 1024)} / ${formatMb(item.file_total_bytes / 1024 / 1024)}` : ''; return <div className="download-item" key={item.id}><div className="download-item-line"><span>{item.model === 'trellis2' ? 'Trellis2 GGUF workflow' : 'SkinToken checkpoints'}</span><strong>{item.status === 'completed' ? 'Ready' : item.status === 'failed' ? 'Failed' : `${item.progress}%`}</strong></div><div className="download-track"><i className={item.status === 'failed' ? 'failed' : item.status === 'completed' ? 'complete' : ''} style={{ width: `${Math.max(4, item.progress)}%` }} /></div><small>{item.error || (hasFile ? `(${item.file_index || 0}/${item.file_count || 10}) ${item.file_name} · ${fileProgress}` : item.message)}</small></div> })}</div> }
+
+function UploadCard({ source, onUpload, label = 'Upload model', hint = 'GLB, GLTF, FBX or OBJ · max 20 MB' }: { source: Artifact | null; onUpload: () => void; label?: string; hint?: string }) { return <button className={`upload-card ${source ? 'has-file' : ''}`} onClick={onUpload}>{source ? <><div className="upload-preview"><Box size={22} /></div><div><strong>{source.name}</strong><span>Replace source</span></div></> : <><div className="upload-icon"><Upload size={19} /></div><div><strong>{label}</strong><span>{hint}</span></div></>}</button> }
+function SectionLabel({ children }: { children: ReactNode }) { return <div className="section-label">{children}</div> }
+function GenerateControls({ resolution, setResolution, caps, source, outputDirectory, onChooseOutput, onUpload }: { resolution: 512 | 768 | 1024; setResolution: (v: 512 | 768 | 1024) => void; caps: Capabilities | null; source: Artifact | null; outputDirectory?: string; onChooseOutput: () => void; onUpload: () => void }) { return <><div className="mode-switch"><button className="selected"><ImagePlus size={14} /> Image to 3D</button><button disabled><Layers3 size={14} /> Multi-view <span>soon</span></button></div><SectionLabel>Source image</SectionLabel><UploadCard source={source} onUpload={onUpload} label="Upload reference image" /><SectionLabel>Output folder</SectionLabel><div className="output-location"><span title={outputDirectory}>{outputDirectory || 'AISmith 3D artifact cache'}</span><button onClick={onChooseOutput}>Choose…</button></div><div className="option-row"><label>Model runtime</label><span className="model-pill"><span className="live-dot" /> Trellis2 C++ (f16) · CUDA</span></div><div className="option-row"><label>Output profile</label><div className="segmented"><button className={resolution === 512 ? 'selected' : ''} onClick={() => setResolution(512)}>Coarse</button><button className={resolution === 1024 || resolution === 768 ? 'selected' : ''} onClick={() => setResolution(1024)}>Fine</button></div></div><div className="info-line"><Gauge size={14} /> Coarse mode uses marching cubes extraction for speed. Fine mode uses Shape-SLAT dual-grid geometry for high-fidelity 3D assets.</div></> }
+function RetopoControls({ targetFaces, setTargetFaces, quality, setQuality, source, onUpload }: { targetFaces: number; setTargetFaces: (v: number) => void; quality: string; setQuality: (v: 'game' | 'balanced' | 'high') => void; source: Artifact | null; onUpload: () => void }) { return <><SectionLabel>Source model</SectionLabel><UploadCard source={source} onUpload={onUpload} /><SectionLabel>Remesh profile</SectionLabel><div className="preset-grid">{(['game', 'balanced', 'high'] as const).map((item) => <button className={quality === item ? 'selected' : ''} onClick={() => setQuality(item)} key={item}><Scissors size={14} /><span>{item === 'game' ? 'Game ready' : item[0].toUpperCase() + item.slice(1)}</span><small>{item === 'game' ? '10k' : item === 'balanced' ? '25k' : '50k'} tris</small></button>)}</div><div className="range-row"><label>Target faces <strong>{targetFaces.toLocaleString()}</strong></label><input type="range" min="500" max="100000" step="500" value={targetFaces} onChange={(e) => setTargetFaces(Number(e.target.value))} /></div><div className="info-line"><ScanLine size={14} /> AutoRemesher runs CPU-side in an isolated process</div></> }
+function RigControls({ source, onUpload, blender }: { source: Artifact | null; onUpload: () => void; blender?: boolean }) { return <><SectionLabel>Source model</SectionLabel><UploadCard source={source} onUpload={onUpload} /><div className={`dependency-card ${blender ? 'ok' : ''}`}><div className="dependency-icon"><Settings2 size={16} /></div><div><strong>SkinToken rig pipeline</strong><span>{blender ? 'Blender 4.2 detected' : 'Blender 4.2+ required for native rigging'}</span></div><span className="dependency-status">{blender ? 'Ready' : 'Setup'}</span></div><div className="rig-features"><div><UserRound size={16} /><span>Humanoid skeleton</span></div><div><RotateCcw size={16} /><span>Rest-pose normalize</span></div><div><Download size={16} /><span>FBX → GLB export</span></div></div></> }
+function PaintControls({ color, setColor, roughness, setRoughness, metallic, setMetallic, brushSize, setBrushSize, brushOpacity, setBrushOpacity, brushHardness, setBrushHardness, strokes, setStrokes, source, onUpload }: { color: string; setColor: (v: string) => void; roughness: number; setRoughness: (v: number) => void; metallic: number; setMetallic: (v: number) => void; brushSize: number; setBrushSize: (v: number) => void; brushOpacity: number; setBrushOpacity: (v: number) => void; brushHardness: number; setBrushHardness: (v: number) => void; strokes: PaintStroke[]; setStrokes: (v: PaintStroke[]) => void; source: Artifact | null; onUpload: () => void }) { return <><SectionLabel>Source model</SectionLabel><UploadCard source={source} onUpload={onUpload} /><SectionLabel>Material</SectionLabel><div className="color-row"><input type="color" value={color} onChange={(e) => setColor(e.target.value)} /><div><strong>Base color</strong><span>{color.toUpperCase()}</span></div></div><div className="range-row"><label>Roughness <strong>{roughness}%</strong></label><input type="range" min="0" max="100" value={roughness} onChange={(e) => setRoughness(Number(e.target.value))} /></div><div className="range-row"><label>Metallic <strong>{metallic}%</strong></label><input type="range" min="0" max="100" value={metallic} onChange={(e) => setMetallic(Number(e.target.value))} /></div><SectionLabel>Brush mask</SectionLabel><PaintCanvas color={color} size={brushSize} opacity={brushOpacity} hardness={brushHardness} strokes={strokes} setStrokes={setStrokes} /><div className="range-row"><label>Size <strong>{brushSize}%</strong></label><input type="range" min="2" max="30" value={brushSize} onChange={(e) => setBrushSize(Number(e.target.value))} /></div><div className="range-row"><label>Opacity <strong>{brushOpacity}%</strong></label><input type="range" min="1" max="100" value={brushOpacity} onChange={(e) => setBrushOpacity(Number(e.target.value))} /></div><div className="range-row"><label>Hardness <strong>{brushHardness}%</strong></label><input type="range" min="1" max="100" value={brushHardness} onChange={(e) => setBrushHardness(Number(e.target.value))} /></div><div className="brush-row"><button className="brush selected"><Brush size={15} /></button><button className="brush" onClick={() => setStrokes([])}><RotateCcw size={15} /></button><span>{strokes.length ? `${strokes.length} stroke${strokes.length === 1 ? '' : 's'}` : 'Basic mask'}</span></div><div className="info-line"><Paintbrush size={14} /> Paint strokes are baked into a packed GLB texture</div></> }
+
+function PaintCanvas({ color, size, opacity, hardness, strokes, setStrokes }: { color: string; size: number; opacity: number; hardness: number; strokes: PaintStroke[]; setStrokes: (v: PaintStroke[]) => void }) {
+  const ref = useRef<HTMLCanvasElement>(null)
+  const painting = useRef(false)
+  const draw = (event: React.PointerEvent<HTMLCanvasElement>) => { const canvas = ref.current; if (!canvas) return; const rect = canvas.getBoundingClientRect(); setStrokes([...strokes, { x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)), y: Math.max(0, Math.min(1, 1 - (event.clientY - rect.top) / rect.height)), radius: size / 100, color, opacity: opacity / 100, hardness: hardness / 100 }]) }
+  useEffect(() => { const canvas = ref.current; if (!canvas) return; const ctx = canvas.getContext('2d')!; ctx.fillStyle = '#24232b'; ctx.fillRect(0, 0, canvas.width, canvas.height); ctx.strokeStyle = '#3b3945'; ctx.lineWidth = 1; for (let i = 1; i < 8; i++) { ctx.beginPath(); ctx.moveTo(i * canvas.width / 8, 0); ctx.lineTo(i * canvas.width / 8, canvas.height); ctx.stroke(); ctx.beginPath(); ctx.moveTo(0, i * canvas.height / 8); ctx.lineTo(canvas.width, i * canvas.height / 8); ctx.stroke() } strokes.forEach((stroke) => { ctx.globalAlpha = stroke.opacity; ctx.fillStyle = stroke.color; ctx.beginPath(); ctx.arc(stroke.x * canvas.width, (1 - stroke.y) * canvas.height, stroke.radius * canvas.width, 0, Math.PI * 2); ctx.fill() }); ctx.globalAlpha = 1 }, [strokes])
+  return <canvas ref={ref} width={280} height={150} className="paint-canvas" onPointerDown={(event) => { painting.current = true; event.currentTarget.setPointerCapture(event.pointerId); draw(event) }} onPointerMove={(event) => { if (painting.current) draw(event) }} onPointerUp={() => { painting.current = false }} onPointerCancel={() => { painting.current = false }} />
+}
+function AnimateControls({ animation, setAnimation, source, onUpload }: { animation: string; setAnimation: (v: string) => void; source: Artifact | null; onUpload: () => void }) { return <><SectionLabel>Rigged source</SectionLabel><UploadCard source={source} onUpload={onUpload} /><SectionLabel>Motion library</SectionLabel><div className="motion-list">{['Idle', 'Walk', 'Run', 'Wave'].map((item) => <button className={animation === item ? 'selected' : ''} onClick={() => setAnimation(item)} key={item}><Play size={13} fill="currentColor" /><span>{item}</span><small>{item === 'Run' ? '0:01' : '0:02'}</small></button>)}</div><div className="info-line"><Film size={14} /> Retargeting uses the SkinToken skeleton map</div></> }

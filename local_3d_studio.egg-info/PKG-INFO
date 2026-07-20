@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: local-3d-studio
+Version: 0.1.0
+Summary: A local, memory-aware 3D generation studio for the OpenAI Build Week hackathon.
+Requires-Python: >=3.11
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: python-multipart>=0.0.9
+Requires-Dist: pillow>=10.0
+Requires-Dist: numpy>=1.26
+Requires-Dist: trimesh>=4.4
+Provides-Extra: openai
+Requires-Dist: openai>=1.60; extra == "openai"
