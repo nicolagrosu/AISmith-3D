@@ -231,9 +231,8 @@ downloads: dict[str, DownloadState] = {}
 def _model_readiness() -> dict[str, bool]:
     skintoken_root = native.skintoken_model_dir()
     return {
-        "trellis_cpp_ready": native.trellis_gguf_ready(),
-        "trellis_gguf_ready": native.trellis_gguf_ready(),
-        "trellis_texture_ready": native.trellis_texture_ready(),
+        "trellis_cpp_ready": native.trellis_workflow_ready(),
+        "trellis_gguf_ready": native.trellis_workflow_ready(),
         "skintoken_ready": (skintoken_root / "experiments/skin_vae_2_10_32768/last.ckpt").exists() and (skintoken_root / "experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt").exists(),
     }
 
@@ -329,9 +328,9 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
         if request.kind == "generate":
             if source is None or source.kind not in {"image", "png", "jpg", "jpeg", "webp"}:
                 raise ValueError("Generate requires a single uploaded image")
-            mode_name = "coarse (marching-cubes)" if request.resolution == 512 else "fine (dual-grid)"
-            _job_log(job, f"Selected direct Trellis2 C++ workflow in {mode_name} mode", 12)
-            result = await asyncio.to_thread(native.run_trellis_gguf, Path(source.path), output, request.resolution, lambda message: _job_log(job, message, _trellis_job_progress(message, job.progress)))
+            mode_name = "fast" if request.resolution == 512 else "high-detail"
+            _job_log(job, f"Selected Trellis2 standalone workflow in {mode_name} mode", 12)
+            result = await asyncio.to_thread(native.run_trellis, Path(source.path), output, request.resolution, lambda message: _job_log(job, message, _trellis_job_progress(message, job.progress)))
             metadata.update(result)
         elif source:
             _job_log(job, f"Loading {source.name} into the {request.kind} worker", 15)
@@ -399,7 +398,6 @@ async def capabilities() -> dict[str, Any]:
             "trellis_cpp": False,
             "trellis_cpp_ready": readiness["trellis_cpp_ready"],
             "trellis_gguf_ready": readiness["trellis_gguf_ready"],
-            "trellis_texture_ready": readiness["trellis_texture_ready"],
             "trellis2_native": readiness["trellis_gguf_ready"],
             "autoremesher_native": remesher is not None,
             "skintoken_native": (skintoken_repo / "nodes.py").exists(),
@@ -438,7 +436,7 @@ async def create_job(request: JobRequest, background_tasks: BackgroundTasks) -> 
     readiness = _model_readiness()
     if request.kind == "generate":
         if not readiness["trellis_cpp_ready"]:
-            raise HTTPException(status_code=409, detail="The direct Trellis2 GGUF Q4 workflow bundle is not downloaded. Open the Generate tab and download it before starting inference.")
+            raise HTTPException(status_code=409, detail="The Trellis2 geometry and texture workflow is not downloaded. Open the Generate tab and download it before starting inference.")
     if request.kind == "rig" and not readiness["skintoken_ready"]:
         raise HTTPException(status_code=409, detail="SkinToken checkpoints are not downloaded. Open the Auto Rig tab and download them before starting rigging.")
     if request.kind != "generate" and not request.source_artifact_id:
@@ -457,7 +455,7 @@ async def list_downloads() -> list[dict[str, Any]]:
 
 @app.post("/api/models/{name}/download", response_model=DownloadState)
 async def download_model(name: str, background_tasks: BackgroundTasks) -> DownloadState:
-    if name not in {"trellis2", "trellis2-texture", "skintoken"}:
+    if name not in {"trellis2", "skintoken"}:
         raise HTTPException(status_code=404, detail="This tab has no downloadable model package")
     gpu = _gpu_info()
     if name == "skintoken" and not gpu["native_inference_ready"]:
@@ -465,8 +463,6 @@ async def download_model(name: str, background_tasks: BackgroundTasks) -> Downlo
     readiness = _model_readiness()
     if name == "trellis2":
         ready = readiness["trellis_cpp_ready"]
-    elif name == "trellis2-texture":
-        ready = readiness["trellis_texture_ready"]
     else:
         ready = readiness["skintoken_ready"]
     if ready:
