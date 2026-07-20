@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TRELLIS_GGUF_MODELS = "Aero-Ex/Trellis2-GGUF"
 DINOV3_MODELS = "Aero-Ex/Dinov3"
 BIREFNET_MODEL = "ZhengPeng7/BiRefNet"
+# LocalAI-io prebuilt f16 GGUFs (geometry + texture pipeline)
+LOCALAI_T2   = "LocalAI-io/TRELLIS.2-4B-GGUF"
 BIREFNET_REQUIRED_FILES = ("config.json", "BiRefNet_config.py", "birefnet.py", "model.safetensors")
 
 
@@ -104,6 +106,14 @@ def trellis_gguf_manifest() -> list[tuple[str, str, str]]:
         suffixes = (".json", ".safetensors") if kind == "safetensors" else (".json", "_Q4_K_M.gguf")
         for suffix in suffixes:
             files.append((TRELLIS_GGUF_MODELS, f"{path}{suffix}", f"{path}{suffix}"))
+    # Prebuilt texture GGUFs from LocalAI-io (direct f16 download, no conversion needed)
+    for tex_file in (
+        "shape_enc_f16.gguf",
+        "tex_dec_f16.gguf",
+        "tex_slat_flow_512_f16.gguf",
+        "tex_slat_flow_1024_f16.gguf",
+    ):
+        files.append((LOCALAI_T2, tex_file, f"ggufs/{tex_file}"))
     return files
 
 

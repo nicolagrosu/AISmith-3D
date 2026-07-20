@@ -7,4 +7,8 @@ __pycache__/
 .env
 .env.*
 !.env.example
-
+vendor/trellis.cpp/*.dll
+vendor/trellis.cpp/*.exe
+# trellis2cpp build output (compiled binaries, never commit these)
+vendor/trellis2cpp/build/
+vendor/trellis2cpp/ggufs/

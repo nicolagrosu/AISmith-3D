@@ -49,18 +49,49 @@ def trellis_gguf_model_dir() -> Path:
 
 
 def trellis_gguf_manifest() -> list[tuple[str, str]]:
+    """All model files required for the full geometry+texture pipeline.
+    Texture models are optional — geometry still works without them."""
     return [
-        ("ggufs/dino_f16.gguf", "ggufs/dino_f16.gguf"),
-        ("ggufs/ss_flow_f16.gguf", "ggufs/ss_flow_f16.gguf"),
-        ("ggufs/ss_dec_f16.gguf", "ggufs/ss_dec_f16.gguf"),
-        ("ggufs/slat_flow_f16.gguf", "ggufs/slat_flow_f16.gguf"),
-        ("ggufs/shape_dec_f16.gguf", "ggufs/shape_dec_f16.gguf"),
+        ("ggufs/dino_f16.gguf",        "ggufs/dino_f16.gguf"),
+        ("ggufs/ss_flow_f16.gguf",     "ggufs/ss_flow_f16.gguf"),
+        ("ggufs/ss_dec_f16.gguf",      "ggufs/ss_dec_f16.gguf"),
+        ("ggufs/slat_flow_f16.gguf",   "ggufs/slat_flow_f16.gguf"),
+        ("ggufs/shape_dec_f16.gguf",   "ggufs/shape_dec_f16.gguf"),
+        # Texture pipeline (optional but included in the download target)
+        ("ggufs/shape_enc_f16.gguf",           "ggufs/shape_enc_f16.gguf"),
+        ("ggufs/tex_dec_f16.gguf",             "ggufs/tex_dec_f16.gguf"),
+        ("ggufs/tex_slat_flow_512_f16.gguf",   "ggufs/tex_slat_flow_512_f16.gguf"),
+        ("ggufs/tex_slat_flow_1024_f16.gguf",  "ggufs/tex_slat_flow_1024_f16.gguf"),
     ]
 
 
+REQUIRED_GEOMETRY_GGUFS = {
+    "ggufs/dino_f16.gguf",
+    "ggufs/ss_flow_f16.gguf",
+    "ggufs/ss_dec_f16.gguf",
+    "ggufs/slat_flow_f16.gguf",
+    "ggufs/shape_dec_f16.gguf",
+}
+
+
 def trellis_gguf_missing_files() -> list[Path]:
+    """Returns files missing from the required geometry-only set."""
     root = trellis_gguf_model_dir()
-    return [root / local for _, local in trellis_gguf_manifest() if not (root / local).is_file() or (root / local).stat().st_size == 0]
+    return [root / local for _, local in trellis_gguf_manifest()
+            if local in REQUIRED_GEOMETRY_GGUFS
+            and (not (root / local).is_file() or (root / local).stat().st_size == 0)]
+
+
+def trellis_texture_ready() -> bool:
+    """True when all four texture GGUFs are present on disk."""
+    root = trellis_gguf_model_dir()
+    tex_files = [
+        root / "ggufs/shape_enc_f16.gguf",
+        root / "ggufs/tex_dec_f16.gguf",
+        root / "ggufs/tex_slat_flow_512_f16.gguf",
+        root / "ggufs/tex_slat_flow_1024_f16.gguf",
+    ]
+    return all(p.is_file() and p.stat().st_size > 0 for p in tex_files)
 
 
 def trellis_gguf_ready() -> bool:
@@ -248,117 +279,186 @@ def run_trellis(input_image: Path, output_glb: Path, resolution: int, progress: 
 
 
 def run_trellis_gguf(input_image: Path, output_glb: Path, resolution: int, progress: Progress | None = None) -> dict[str, Any]:
-    """Run the trellis2cpp C++ pipeline directly in-process via ctypes."""
-    from backend.app.trellis2_wrapper import Trellis2Wrapper
-    import trimesh
+    """Run the full Trellis2 geometry+texture C++ pipeline.
+
+    Uses the pr-1 trellis2cpp DLL which implements the complete pipeline:
+    sparse-structure -> shape SLAT -> mesh + PBR texture flow -> UV-atlas GLB.
+    Falls back gracefully to geometry-only clay mesh when texture GGUFs are absent.
+    """
+    from backend.app.trellis2_wrapper import (
+        Trellis2Wrapper, T2_PIPE_AUTO, T2_PIPE_512, T2_PIPE_1024,
+        T2_PIPE_COARSE, T2_BACKGROUND_AUTO, T2_CAP_TEXTURE,
+    )
     import random
-    
+    import io
+    from PIL import Image
+
     gguf_dir = trellis_gguf_model_dir() / "ggufs"
-    dino = gguf_dir / "dino_f16.gguf"
-    ss_flow = gguf_dir / "ss_flow_f16.gguf"
-    ss_dec = gguf_dir / "ss_dec_f16.gguf"
+
+    # ── Required geometry GGUFs ───────────────────────────────────────────
+    dino      = gguf_dir / "dino_f16.gguf"
+    ss_flow   = gguf_dir / "ss_flow_f16.gguf"
+    ss_dec    = gguf_dir / "ss_dec_f16.gguf"
     slat_flow = gguf_dir / "slat_flow_f16.gguf"
     shape_dec = gguf_dir / "shape_dec_f16.gguf"
 
-    # Make sure required GGUFs exist
-    for path in (dino, ss_flow, ss_dec):
-        if not path.is_file():
-            raise RuntimeError(f"Required model file is missing: {path.name}. Please run conversion first.")
+    for p in (dino, ss_flow, ss_dec):
+        if not p.is_file():
+            raise RuntimeError(
+                f"Required geometry model is missing: {p.name}. "
+                "Download models from the Generate tab first."
+            )
 
-    has_fine = (resolution > 512) and slat_flow.is_file() and shape_dec.is_file()
-    
-    from PIL import Image
-    import io
+    # ── Optional texture GGUFs ────────────────────────────────────────────
+    shape_enc     = gguf_dir / "shape_enc_f16.gguf"
+    tex_dec       = gguf_dir / "tex_dec_f16.gguf"
+    tex_flow_512  = gguf_dir / "tex_slat_flow_512_f16.gguf"
+    tex_flow_1024 = gguf_dir / "tex_slat_flow_1024_f16.gguf"
 
-    # Convert any input format (including WebP) to PNG before passing to C++
+    def _opt(p: Path) -> str | None:
+        return str(p) if p.is_file() and p.stat().st_size > 0 else None
+
+    has_slat  = slat_flow.is_file() and shape_dec.is_file()
+    has_tex   = all(p.is_file() and p.stat().st_size > 0
+                    for p in (shape_enc, tex_dec, tex_flow_512))
+
+    # ── Pick pipeline type ────────────────────────────────────────────────
+    if resolution <= 512:
+        pipe_type = T2_PIPE_COARSE
+        mode_label = "coarse (marching-cubes)"
+    elif resolution >= 1024 and has_slat:
+        pipe_type = T2_PIPE_1024
+        mode_label = "fine 1024 cascade"
+    elif has_slat:
+        pipe_type = T2_PIPE_512
+        mode_label = "fine 512 dual-grid"
+    else:
+        pipe_type = T2_PIPE_COARSE
+        mode_label = "coarse (marching-cubes, slat models missing)"
+
+    if has_tex:
+        mode_label += " + PBR texture"
+
+    # ── Convert input to PNG bytes ─────────────────────────────────────────
     with Image.open(input_image) as img:
         img_rgba = img.convert("RGBA")
         png_io = io.BytesIO()
         img_rgba.save(png_io, format="PNG")
         image_bytes = png_io.getvalue()
-    
+
     if progress:
-        progress("Loading Trellis2 C++ pipeline models...")
-        
+        progress(f"Loading Trellis2 pipeline ({mode_label})...")
+
     wrapper = Trellis2Wrapper(ROOT / "vendor" / "trellis2cpp" / "build")
     pipeline = wrapper.load_pipeline(
-        str(dino),
-        str(ss_flow),
-        str(ss_dec),
-        str(slat_flow) if has_fine else None,
-        str(shape_dec) if has_fine else None
+        dino=str(dino),
+        ss_flow=str(ss_flow),
+        ss_dec=str(ss_dec),
+        slat_flow=_opt(slat_flow),
+        slat_hr_flow=None,               # reserved for future HR cascade
+        shape_dec=_opt(shape_dec),
+        shape_enc=_opt(shape_enc),
+        tex_dec=_opt(tex_dec),
+        tex_flow=_opt(tex_flow_512),
+        tex_flow_hr=_opt(tex_flow_1024),
     )
-    
+
     try:
-        def on_cpp_progress(stage, step, total):
-            stages = {
-                0: "Pre-processing reference image",
-                1: "Encoding image with DINOv3",
-                2: f"Sampling sparse structure (step {step}/{total})" if total > 0 else "Sampling sparse structure",
-                3: "Decoding occupancy grid",
-                4: f"Sampling shape SLAT (step {step}/{total})" if total > 0 else "Sampling shape SLAT",
-                5: "Decoding fine shape geometry",
-                6: "Extracting triangle mesh"
-            }
-            msg = stages.get(stage, "Running Trellis2 generation")
+        _STAGE_LABELS = {
+            0:  "Pre-processing image",
+            1:  "Encoding with DINOv3",
+            2:  "Sparse-structure flow",
+            3:  "Decoding occupancy grid",
+            4:  "Shape SLAT flow",
+            5:  "Decoding shape geometry",
+            6:  "Extracting mesh",
+            7:  "Upsampling to 1024 voxels",
+            8:  "1024 shape SLAT flow",
+            9:  "1024 shape decode",
+            10: "PBR texture flow",
+        }
+
+        def on_progress(stage: int, step: int, total: int) -> None:
+            label = _STAGE_LABELS.get(stage, f"Stage {stage}")
+            if total > 0:
+                label = f"{label} (step {step}/{total})"
             if progress:
-                progress(msg)
+                progress(label)
 
         if progress:
-            progress("Running direct Trellis2 C++ image-to-3D generation...")
-            
-        seed = random.randint(0, 2**32 - 1)
-        
+            progress("Running Trellis2 image-to-3D generation...")
+
+        seed = random.randint(0, 2 ** 32 - 1)
         mesh_data = wrapper.generate(
             pipeline,
             image_bytes,
             seed=seed,
-            steps=12,
-            guidance=7.5,
-            progress_cb=on_cpp_progress
+            pipeline_type=pipe_type,
+            background_mode=T2_BACKGROUND_AUTO,
+            steps=0,           # use C++ defaults (12)
+            guidance=-1.0,     # use C++ defaults (7.5)
+            texture_steps=0,   # use C++ defaults (12)
+            progress_cb=on_progress,
         )
     finally:
         wrapper.free_pipeline(pipeline)
 
     if progress:
-        progress("Building GLB mesh artifact...")
-        
-    vertices = []
-    for i in range(0, len(mesh_data["vertices"]), 3):
-        # Rotate Z-up (Trellis) to Y-up (gLTF/GLB): y_new = z, z_new = -y
-        x = mesh_data["vertices"][i]
-        y = mesh_data["vertices"][i+1]
-        z = mesh_data["vertices"][i+2]
-        vertices.append([x, z, -y])
-        
-    faces = []
-    for i in range(0, len(mesh_data["faces"]), 3):
-        faces.append([mesh_data["faces"][i], mesh_data["faces"][i+1], mesh_data["faces"][i+2]])
+        progress("Baking GLB artifact...")
 
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
-    mesh.fix_normals()
-    trimesh.repair.fill_holes(mesh)
-    
-    # Extract the computed vertex normals and watertight geometry, and re-create Trimesh so they are exported
-    vertex_normals = mesh.vertex_normals
-    mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, vertex_normals=vertex_normals)
-    
-    # Assign a standard clay PBR material so the model viewer renders a solid, shaded mesh
-    from trimesh.visual.material import PBRMaterial
-    mesh.visual.material = PBRMaterial(
-        metallicFactor=0.1,
-        roughnessFactor=0.7,
-        baseColorFactor=[220, 220, 220, 255],
-        doubleSided=True
-    )
-    
-    mesh.export(output_glb, file_type="glb")
-    
+    if mesh_data["has_pbr"]:
+        # Full PBR path: let the C++ xatlas bake produce the final GLB
+        # This avoids trimesh stripping UV data and gives the best quality.
+        if progress:
+            progress("Baking UV-atlas textured GLB (xatlas)...")
+        glb_bytes = wrapper.bake_glb(
+            verts=mesh_data["vertices"],
+            tris=mesh_data["faces"],
+            pbr=mesh_data["pbr"],
+            texture_size=0,       # auto: 2048 @1024, 1024 @512
+            component_filter=0,   # remove tiny floating islands
+        )
+        output_glb.write_bytes(glb_bytes)
+        textured = True
+    else:
+        # Geometry-only path: use trimesh with a clay PBR material
+        import trimesh
+        from trimesh.visual.material import PBRMaterial
+
+        vertices = [
+            [mesh_data["vertices"][i],
+             mesh_data["vertices"][i + 2],
+             -mesh_data["vertices"][i + 1]]
+            for i in range(0, len(mesh_data["vertices"]), 3)
+        ]
+        faces = [
+            [mesh_data["faces"][i],
+             mesh_data["faces"][i + 1],
+             mesh_data["faces"][i + 2]]
+            for i in range(0, len(mesh_data["faces"]), 3)
+        ]
+
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+        mesh.fix_normals()
+        trimesh.repair.fill_holes(mesh)
+        vnormals = mesh.vertex_normals
+        mesh = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces,
+                               vertex_normals=vnormals)
+        mesh.visual.material = PBRMaterial(
+            metallicFactor=0.1,
+            roughnessFactor=0.7,
+            baseColorFactor=[220, 220, 220, 255],
+            doubleSided=True,
+        )
+        mesh.export(output_glb, file_type="glb")
+        textured = False
+
     return {
         "backend": "trellis2cpp",
-        "model_set": "rms80/trellis2cpp",
+        "model_set": "rms80/trellis2cpp pr-1",
         "resolution": resolution,
-        "mode": "fine (dual-grid)" if has_fine else "coarse (marching-cubes)"
+        "mode": mode_label,
+        "textured": textured,
     }
 
 
