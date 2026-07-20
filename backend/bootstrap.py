@@ -179,6 +179,7 @@ def download_trellis() -> None:
                     raise RuntimeError(f"Could not download BiRefNet after 3 attempts: {exc}") from exc
                 print(f"[AISmith 3D] BiRefNet connection failed; retrying ({attempt}/3)...")
                 time.sleep(attempt * 3)
+
     missing = [model_root / relative for _, _, relative in trellis_gguf_manifest() if not (model_root / relative).is_file()]
     missing.extend(birefnet_root / file for file in BIREFNET_REQUIRED_FILES if not (birefnet_root / file).is_file())
     if not birefnet_weights.is_file() or birefnet_weights.stat().st_size < 100 * 1024 * 1024:
@@ -187,6 +188,39 @@ def download_trellis() -> None:
         formatted = "\n  - ".join(path.name for path in missing)
         raise RuntimeError(f"Trellis2 GGUF download is incomplete. Missing:\n  - {formatted}")
     print("[AISmith 3D] Trellis2 GGUF Q4 workflow bundle is ready.")
+
+
+def download_trellis_texture() -> None:
+    """Download only the 4 texture GGUF files needed for PBR output."""
+    from huggingface_hub import hf_hub_download
+    model_root = ROOT / "studio-data" / "models" / "Trellis2"
+    gguf_dir = model_root / "ggufs"
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+    tex_files = [
+        (LOCALAI_T2, "shape_enc_f16.gguf"),
+        (LOCALAI_T2, "tex_dec_f16.gguf"),
+        (LOCALAI_T2, "tex_slat_flow_512_f16.gguf"),
+        (LOCALAI_T2, "tex_slat_flow_1024_f16.gguf"),
+    ]
+    for index, (repo, filename) in enumerate(tex_files, start=1):
+        dest = gguf_dir / filename
+        if dest.is_file() and dest.stat().st_size > 0:
+            print(f"[AISmith 3D] ({index}/{len(tex_files)}) {filename} already present")
+            continue
+        for attempt in range(1, 4):
+            try:
+                AISmithDownloadProgress.file_name = filename
+                AISmithDownloadProgress.file_index = index
+                AISmithDownloadProgress.file_count = len(tex_files)
+                print(f"[AISmith 3D] ({index}/{len(tex_files)}) Downloading {filename} from {repo} (attempt {attempt}/3)...")
+                hf_hub_download(repo_id=repo, filename=filename, local_dir=gguf_dir, tqdm_class=AISmithDownloadProgress)
+                break
+            except Exception as exc:
+                if attempt == 3:
+                    raise RuntimeError(f"Could not download {filename} after 3 attempts: {exc}") from exc
+                print(f"[AISmith 3D] ({index}/{len(tex_files)}) {filename} connection failed; retrying...")
+                time.sleep(attempt * 2)
+    print("[AISmith 3D] Trellis2 texture GGUFs are ready.")
 
 
 def download_skintoken() -> None:
@@ -206,7 +240,7 @@ def download_skintoken() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--download-models", action="store_true")
-    parser.add_argument("--download-model", choices=("trellis2", "skintoken", "all"))
+    parser.add_argument("--download-model", choices=("trellis2", "trellis2-texture", "skintoken", "all"))
     args = parser.parse_args()
     if args.download_models:
         download_trellis()
@@ -214,6 +248,8 @@ def main() -> None:
     elif args.download_model:
         if args.download_model in {"trellis2", "all"}:
             download_trellis()
+        if args.download_model == "trellis2-texture":
+            download_trellis_texture()
         if args.download_model in {"skintoken", "all"}:
             download_skintoken()
 

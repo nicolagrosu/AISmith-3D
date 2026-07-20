@@ -233,6 +233,7 @@ def _model_readiness() -> dict[str, bool]:
     return {
         "trellis_cpp_ready": native.trellis_gguf_ready(),
         "trellis_gguf_ready": native.trellis_gguf_ready(),
+        "trellis_texture_ready": native.trellis_texture_ready(),
         "skintoken_ready": (skintoken_root / "experiments/skin_vae_2_10_32768/last.ckpt").exists() and (skintoken_root / "experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt").exists(),
     }
 
@@ -398,6 +399,7 @@ async def capabilities() -> dict[str, Any]:
             "trellis_cpp": False,
             "trellis_cpp_ready": readiness["trellis_cpp_ready"],
             "trellis_gguf_ready": readiness["trellis_gguf_ready"],
+            "trellis_texture_ready": readiness["trellis_texture_ready"],
             "trellis2_native": readiness["trellis_gguf_ready"],
             "autoremesher_native": remesher is not None,
             "skintoken_native": (skintoken_repo / "nodes.py").exists(),
@@ -455,7 +457,7 @@ async def list_downloads() -> list[dict[str, Any]]:
 
 @app.post("/api/models/{name}/download", response_model=DownloadState)
 async def download_model(name: str, background_tasks: BackgroundTasks) -> DownloadState:
-    if name not in {"trellis2", "skintoken"}:
+    if name not in {"trellis2", "trellis2-texture", "skintoken"}:
         raise HTTPException(status_code=404, detail="This tab has no downloadable model package")
     gpu = _gpu_info()
     if name == "skintoken" and not gpu["native_inference_ready"]:
@@ -463,6 +465,8 @@ async def download_model(name: str, background_tasks: BackgroundTasks) -> Downlo
     readiness = _model_readiness()
     if name == "trellis2":
         ready = readiness["trellis_cpp_ready"]
+    elif name == "trellis2-texture":
+        ready = readiness["trellis_texture_ready"]
     else:
         ready = readiness["skintoken_ready"]
     if ready:
