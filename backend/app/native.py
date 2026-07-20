@@ -6,7 +6,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -135,6 +134,35 @@ def trellis_cli() -> Path | None:
     return next((path.resolve() for path in candidates if path.exists()), None)
 
 
+def prepare_trellis_input(input_image: Path) -> bytes:
+    """Letterbox an image into a transparent square without changing its aspect ratio.
+
+    trellis.cpp's bundled BiRefNet path stretches non-square images to 1024².
+    A transparent, aspect-fit PNG makes the runtime use its alpha-aware path
+    instead; alpha-zero padding is excluded from the object cutout.
+    """
+    import io
+    from PIL import Image
+
+    canvas_size = 1024
+    with Image.open(input_image) as source:
+        rgba = source.convert("RGBA")
+        width, height = rgba.size
+        if width <= 0 or height <= 0:
+            raise ValueError("Trellis2 input image has invalid dimensions")
+        scale = min(canvas_size / width, canvas_size / height)
+        resized = rgba.resize(
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+    offset = ((canvas_size - resized.width) // 2, (canvas_size - resized.height) // 2)
+    canvas.alpha_composite(resized, dest=offset)
+    output = io.BytesIO()
+    canvas.save(output, format="PNG")
+    return output.getvalue()
+
+
 def skintoken_repo() -> Path:
     return configured_path("SKINTOKEN_REPO_DIR", ROOT / "vendor" / "ComfyUI-SkinTokens")
 
@@ -199,7 +227,7 @@ def run_trellis(input_image: Path, output_glb: Path, resolution: int, progress: 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
         port = int(probe.getsockname()[1])
-    command = [str(cli), "--models", str(trellis_model_dir()), "--res", str(resolution), "--bg-removal", "birefnet", "--require-gpu", "--seed", "0", "--host", "127.0.0.1", "--port", str(port)]
+    command = [str(cli), "--models", str(trellis_model_dir()), "--res", str(resolution), "--require-gpu", "--seed", "0", "--host", "127.0.0.1", "--port", str(port)]
     if progress:
         progress("Starting private native trellis.cpp worker")
     server = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -248,27 +276,16 @@ def run_trellis(input_image: Path, output_glb: Path, resolution: int, progress: 
         else:
             raise RuntimeError("trellis.cpp worker did not become ready within 90 seconds")
         if progress:
-            progress("Running native Trellis image-to-3D with BiRefNet background removal")
-        # trellis-server's multipart handler writes requests to a .png temp
-        # file.  Convert WebP/JPEG uploads first so the bytes always match the
-        # extension consumed by BiRefNet.
-        with Image.open(input_image) as source_image:
-            prepared = source_image.convert("RGBA") if "A" in source_image.getbands() else source_image.convert("RGB")
-            png_handle = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-            png_path = Path(png_handle.name)
-            png_handle.close()
-            prepared.save(png_path, format="PNG")
-        try:
-            image_handle = png_path.open("rb")
-            response = requests.post(
-                f"http://127.0.0.1:{port}/generate",
-                files={"image": ("reference.png", image_handle, "image/png")},
-                data={"seed": "0", "resolution": str(resolution), "bg_removal": "birefnet"},
-                timeout=7200,
-            )
-            image_handle.close()
-        finally:
-            png_path.unlink(missing_ok=True)
+            progress("Preparing aspect-preserving transparent input for Trellis2")
+        prepared_png = prepare_trellis_input(input_image)
+        if progress:
+            progress("Running native Trellis image-to-3D")
+        response = requests.post(
+            f"http://127.0.0.1:{port}/generate",
+            files={"image": ("reference.png", prepared_png, "image/png")},
+            data={"seed": "0", "resolution": str(resolution)},
+            timeout=7200,
+        )
         if not response.ok:
             native_log = stop_server().strip()
             raise RuntimeError(f"trellis.cpp generation failed ({response.status_code}): {response.text[-500:]}\nNative runtime log:\n{native_log[-1800:]}")
