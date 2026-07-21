@@ -299,90 +299,6 @@ def paint(input_path: str, output_path: str, settings: dict) -> None:
     export_glb(output_path)
 
 
-def action_curves(action):
-    if getattr(action, "is_action_legacy", False):
-        return action.fcurves
-    curves = []
-    for layer in action.layers:
-        for strip in layer.strips:
-            for bag in strip.channelbags:
-                curves.extend(bag.fcurves)
-    return curves
-
-
-ALIASES = {
-    "root": "root", "hips": "pelvis", "mixamorighips": "pelvis", "pelvis": "pelvis",
-    "spine": "spine_01", "spine1": "spine_01", "spine01": "spine_01", "spine2": "spine_02", "spine3": "spine_03",
-    "neck": "neck_01", "head": "head", "leftshoulder": "clavicle_l", "rightshoulder": "clavicle_r",
-    "leftarm": "upperarm_l", "rightarm": "upperarm_r", "leftforearm": "lowerarm_l", "rightforearm": "lowerarm_r",
-    "lefthand": "hand_l", "righthand": "hand_r", "leftupleg": "thigh_l", "rightupleg": "thigh_r",
-    "leftleg": "calf_l", "rightleg": "calf_r", "leftfoot": "foot_l", "rightfoot": "foot_r",
-}
-
-
-def normalized(name: str) -> str:
-    return "".join(ch.lower() for ch in name if ch.isalnum())
-
-
-def resolve_bone(name: str, target_names: set[str]) -> str | None:
-    if name in target_names:
-        return name
-    clean = normalized(name)
-    for target in target_names:
-        if normalized(target) == clean:
-            return target
-    side = "_l" if any(x in clean for x in ("left", "_l", "lhand", "larm", "lleg")) else "_r" if any(x in clean for x in ("right", "_r", "rhand", "rarm", "rleg")) else ""
-    base = clean.replace("left", "").replace("right", "").replace("mixamorig", "")
-    mapped = ALIASES.get(clean) or ALIASES.get(base)
-    if mapped and mapped in target_names:
-        return mapped
-    if mapped and side and f"{mapped.rstrip('_lr')}{side}" in target_names:
-        return f"{mapped.rstrip('_lr')}{side}"
-    return None
-
-
-def animate(input_path: str, output_path: str, library_path: str, animation: str) -> None:
-    clear_scene()
-    import_model(input_path)
-    target_armature = next((o for o in bpy.context.scene.objects if o.type == "ARMATURE"), None)
-    if target_armature is None:
-        raise RuntimeError("Animate requires a rigged GLB with an armature from the Auto Rig tab")
-    target_names = {b.name for b in target_armature.data.bones}
-    existing_objects = set(bpy.context.scene.objects)
-    import_model(library_path)
-    source_objects = [o for o in bpy.context.scene.objects if o not in existing_objects]
-    source_armature = next((o for o in source_objects if o.type == "ARMATURE"), None)
-    if source_armature is None:
-        raise RuntimeError("Mesh2Motion library clip has no source armature")
-    wanted = {"Idle": "Idle_A", "Walk": "Walk", "Run": "Sprint", "Wave": "Yes"}.get(animation, animation)
-    source_action = bpy.data.actions.get(wanted) or next(iter(bpy.data.actions), None)
-    if source_action is None:
-        raise RuntimeError(f"Mesh2Motion clip '{wanted}' was not found")
-    output_action = source_action.copy()
-    output_action.name = f"AISmith_{animation}"
-    matched = 0
-    for curve in action_curves(output_action):
-        if 'pose.bones["' not in curve.data_path:
-            continue
-        before = curve.data_path.split('pose.bones["', 1)[1].split('"', 1)[0]
-        target = resolve_bone(before, target_names)
-        if target is None:
-            continue
-        curve.data_path = curve.data_path.replace(f'pose.bones["{before}"]', f'pose.bones["{target}"]')
-        matched += 1
-    if matched < 8:
-        raise RuntimeError(f"Animation '{animation}' is incompatible with this SkinToken skeleton ({matched} mapped channels)")
-    target_armature.animation_data_create()
-    target_armature.animation_data.action = output_action
-    for obj in source_objects:
-        bpy.data.objects.remove(obj, do_unlink=True)
-    for obj in bpy.context.scene.objects:
-        obj.select_set(obj.type in {"MESH", "ARMATURE"})
-    bpy.context.view_layer.objects.active = target_armature
-    export_glb(output_path)
-    log(f"Retargeted {matched} animation channels onto {len(target_names)} target bones")
-
-
 def main() -> None:
     spec = json.loads(sys.argv[sys.argv.index("--") + 1])
     op = spec["op"]
@@ -394,8 +310,6 @@ def main() -> None:
         retopo_bake(spec["source"], spec["target"], spec["output"])
     elif op == "paint":
         paint(spec["input"], spec["output"], spec.get("settings", {}))
-    elif op == "animate":
-        animate(spec["input"], spec["output"], spec["library"], spec.get("animation", "Idle"))
     else:
         raise RuntimeError(f"Unknown Blender worker operation: {op}")
     log("Blender export complete")

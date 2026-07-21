@@ -1,73 +1,104 @@
-# AISmith 3D — Local 3D Generator Studio
+# AISmith 3D — Local AI 3D Studio
 
-AISmith 3D is a Windows-local React/FastAPI studio for the complete pipeline:
+AISmith 3D is a Windows-local studio for taking a reference image through 3D generation, AI-assisted refinement, texture painting, and browser-based rigging/animation. It keeps assets and inference on the local machine; large model files are deliberately downloaded from the app only when a user selects a workflow.
 
-The active hybrid workflow is: single image -> trellis.cpp geometry GLB -> TRELLIS.2 FP8 refine/reconstruct/PBR -> SkinToken -> Mesh2Motion animation.
+> Hackathon note: this repository contains the application and its source dependencies, but **does not include any model weights**. Use the in-app download controls after startup.
 
-`single image → TRELLIS.2 FP8 → PBR GLB → TRELLIS.2 refine/reconstruct → SkinToken → Mesh2Motion animation`
+## What it does
 
-The application does not use ComfyUI as its frontend. Generate uses the bundled trellis.cpp CUDA executable for the alpha-aware C++ workflow. Refine invokes the TRELLIS.2 FP8 Python nodes directly in a short-lived, isolated worker for mesh-conditioned refinement, reconstruction, and PBR texturing without exposing a ComfyUI server.
+| Workflow | Result | Prerequisites |
+| --- | --- | --- |
+| **Generate** | Image → geometry GLB through the native `trellis.cpp` CUDA worker | NVIDIA CUDA-capable GPU |
+| **Refine** | Image + mesh → reconstructed, simplified, PBR-textured GLB with TRELLIS.2 FP8 | NVIDIA CUDA-capable GPU |
+| **Rig + Animate** | Fit a skeleton, bind weights, preview/select animation, export GLB | Modern browser; no GPU or Blender required |
+| **Texture Paint** | Paint a mesh in the browser, bake a base-color texture, export GLB | Blender 4.2+ |
 
-## What is implemented
-
-- Generate: standalone trellis.cpp CUDA geometry worker with alpha-aware transparent 1024 input padding, 512/1024 selection, and `--no-texture`. The C++ texture GGUFs are intentionally not downloaded.
-- Refine: image + mesh-conditioned TRELLIS.2 refinement, CuMesh surface reconstruction, target-face simplification, optional Meshlib hole repair, then TRELLIS.2 PBR texturing on the final mesh. No Instant Meshes or Blender source-texture bake participates in this path.
-- Auto Rig: direct SkinToken model loader/generator, headless Blender path, articulated bone convention, and GLB output. No ComfyUI workflow is required.
-- Texture Paint: browser brush canvas plus material controls; Blender creates UVs when necessary, bakes UV-space strokes to a packed base-color texture, and exports a GLB.
-- Animate: Mesh2Motion's bundled human animation GLB is used as the clip library. Idle/Walk/Run/Wave actions are mapped onto the SkinToken articulated skeleton; incompatible skeletons fail instead of exporting corrupted animation.
-- Memory: only one heavyweight job owns the coordinator lease. Trellis2 and SkinToken run in separate processes, and every Blender stage is short-lived. The API also clears Python and CUDA caches.
-- Artifact handoff: tabs pass artifact IDs and files on disk, not large meshes through browser memory.
+The app runs its API locally at `127.0.0.1:8000` and its Vite UI locally at `127.0.0.1:5173`. It does not expose a ComfyUI server: the TRELLIS.2 refiner is invoked in an isolated local worker.
 
 ## Requirements
 
-For image-to-3D and refinement: Windows 10/11 and an NVIDIA GPU with current drivers. Generate downloads roughly 9.6 GB of trellis.cpp geometry GGUFs. Refine downloads roughly 8.8 GB for `visualbruno/TRELLIS.2-4B-FP8`, DINOv3, and its required sparse decoder. The formats are different and cannot share weights, so the full hybrid install is roughly 18.4 GB. The C++ Generate worker runs at 512 or 1024; Refine is fixed at its 1024 high-quality workflow.
+- Windows 10 or 11
+- Python 3.11 or 3.12
+- Node.js 20+ with npm
+- For **Generate** and **Refine**: NVIDIA GPU, current NVIDIA driver, and CUDA-compatible PyTorch. CPU-only machines can still use the UI and Rig + Animate workflow, but inference buttons return a clear CUDA requirement error.
+- For **Texture Paint** and Blender-assisted conversion: Blender 4.2 or later.
 
-Blender 4.2+ is required for Texture Paint, SkinToken, and animation. The setup script detects it and uses winget to install it when available.
+Disk space is required only when a model workflow is chosen in the UI: Generate downloads approximately 9.6 GB of geometry GGUFs; Refine downloads approximately 8.8 GB for its FP8 runtime and models. Keep additional working space for generated assets.
 
-The current development machine has no NVIDIA GPU and CPU-only PyTorch. Therefore the native Trellis2/SkinToken inference paths are implemented but cannot be executed on this machine; they return a clear CUDA setup error. Blender texture baking and Mesh2Motion retargeting have been exercised locally.
+## Install and run
 
-## Run on Windows
+Clone the repository, then run the one-command launcher from PowerShell:
 
 ```powershell
+git clone https://github.com/intisarGIT/AISmith-3D.git
+cd AISmith-3D
 .\start.ps1 -Install
 ```
 
-`-Install` creates `.venv` inside the project. The launcher always starts the API with that interpreter, detects NVIDIA hardware with `nvidia-smi`, and installs the Python dependencies needed for the studio. Generate downloads its C++ geometry-only bundle on demand. Refine installs its matching CUDA extensions and downloads the FP8 model set separately on demand. Large model downloads are runtime-gated and shown in the bottom-right download dock.
+This creates an isolated `.venv`, installs the Python and frontend dependencies, detects NVIDIA hardware, and starts the API and UI. Open [http://127.0.0.1:5173](http://127.0.0.1:5173).
 
-If an older AISmith 3D API is already listening on port 8000, use `./start.ps1 -RestartApi` to replace it with the dedicated-environment API. The launcher checks for FastAPI, Uvicorn, and PyTorch inside `.venv`; an incomplete environment is repaired automatically.
-
-Then open [http://127.0.0.1:5173](http://127.0.0.1:5173).
-
-Copy `.env.example` to `.env` or set the variables in the process environment. Important paths are:
-
-```text
-TRELLIS_REFINER_DIR=studio-data/tools/trellis2-refiner
-SKINTOKEN_REPO_DIR=vendor/ComfyUI-SkinTokens
-SKINTOKEN_MODELS_DIR=studio-data/models/skintoken
-MESH2MOTION_LIBRARY=vendor/mesh2motion-app/static/animations/human-base-animations.glb
-BLENDER_EXE=C:/Program Files/Blender Foundation/Blender 5.1/blender.exe
-```
-
-The Generate tab downloads the alpha-aware C++ geometry bundle when requested. The Refine tab downloads its isolated FP8 CUDA runtime and image+mesh refinement/PBR weights when requested. Auto Rig downloads SkinToken checkpoints only when requested.
-
-## API
-
-- `GET /api/system/capabilities`
-- `POST /api/assets/upload`
-- `POST /api/jobs`
-- `GET /api/jobs/{id}`
-- `POST /api/models/{name}/unload`
-- `POST /api/system/clear-memory`
-- `GET /api/assets/{id}/download`
-- `POST /api/assets/{id}/open-location`
-## Verification
+To let the setup script install Blender through `winget` when it is missing:
 
 ```powershell
-python -m compileall -q backend
-python -m unittest discover -s backend/tests -v
+.\start.ps1 -Install -InstallBlender
+```
+
+The initial setup must be run in a PowerShell session permitted to create the virtual environment and install packages. Later launches need only:
+
+```powershell
+.\start.ps1
+```
+
+If a previous AISmith API is still listening on port 8000, replace it with:
+
+```powershell
+.\start.ps1 -RestartApi
+```
+
+### Model downloads
+
+After the UI opens, use its **Download models** action in the Generate or Refine workflow. The project intentionally does not download model weights during installation. Downloads are stored below `studio-data/`, which is ignored by Git.
+
+### Optional configuration
+
+Copy `.env.example` to `.env` only when you need non-default paths:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+| Variable | Purpose |
+| --- | --- |
+| `BLENDER_EXE` | Explicit Blender executable path |
+| `TRELLIS_CPP_DIR` | Local `trellis.cpp` runtime directory |
+| `TRELLIS_CPP_MODEL_DIR` | Geometry-model storage location |
+| `AUTOREMESHER_EXE` | Optional AutoRemesher executable path |
+| `PYTORCH_INDEX_URL` | Override the CUDA PyTorch package index |
+
+## Verification
+
+From the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q backend
+.\.venv\Scripts\python.exe -m unittest discover -s backend/tests -v
 npm.cmd --prefix frontend run build
 ```
 
-## Hackathon / Codex record
+## Architecture
 
-Codex/GPT-5.6 was used to implement the application architecture, native worker boundaries, GPU/VRAM policy, artifact API, UI, texture painter, retargeting layer, tests, and documentation. Keep the primary Codex task/session evidence with the submission materials as required by the hackathon rules.
+`reference image → native trellis.cpp geometry → TRELLIS.2 FP8 refine / reconstruct / PBR → Mesh2Motion rig + animation`
+
+Heavyweight inference is serialized through a coordinator lease. TRELLIS.2 runs in a short-lived process, Blender stages are headless and short-lived, and tabs pass artifact IDs/files rather than large meshes through browser memory.
+
+## License and acknowledgements
+
+AISmith 3D’s original application code is available under the [MIT License](LICENSE). It incorporates or integrates third-party projects under their own licenses; their license texts remain with the relevant vendored source. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution, source links, and licensing details.
+
+In particular, thank you to the maintainers and contributors of [TRELLIS.2](https://github.com/microsoft/TRELLIS.2), [trellis.cpp](https://github.com/ilintar/trellis.cpp), [trellis2cpp](https://github.com/rms80/trellis2cpp), [ComfyUI](https://github.com/comfyanonymous/ComfyUI), [ComfyUI-Trellis2](https://github.com/visualbruno/ComfyUI-Trellis2), [AutoRemesher](https://github.com/huxingyi/autoremesher), and [Mesh2Motion](https://github.com/Mesh2Motion/mesh2motion-app).
+
+Model weights are downloaded separately and may have terms different from this repository. Review the applicable Hugging Face model cards and upstream project licenses before redistributing models or outputs.
+
+## Built with Codex
+
+Codex/GPT-5.6 assisted with application architecture, native worker boundaries, GPU/VRAM policy, artifact API, UI, texture painter, retargeting layer, tests, and documentation. Retain the primary Codex task/session evidence with the hackathon submission materials if the event requires it.

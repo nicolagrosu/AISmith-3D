@@ -1,5 +1,6 @@
 param(
   [switch]$Install,
+  [switch]$InstallBlender,
   [switch]$RestartApi
 )
 
@@ -24,9 +25,12 @@ if (Test-Path $venvPython) {
   & $venvPython -c "import fastapi, uvicorn, torch" 2>$null
   $environmentReady = $LASTEXITCODE -eq 0
 }
-if (-not $environmentReady -or $Install) {
+ $frontendReady = Test-Path (Join-Path $root 'frontend/node_modules')
+if (-not $environmentReady -or -not $frontendReady -or $Install) {
   Write-Host 'AISmith 3D environment is missing or incomplete; running the local setup.' -ForegroundColor Cyan
-  & (Join-Path $root 'scripts/setup.ps1')
+  $setupArgs = @()
+  if ($InstallBlender) { $setupArgs += '-InstallBlender' }
+  & (Join-Path $root 'scripts/setup.ps1') @setupArgs
 }
 if (-not (Test-Path $venvPython)) { throw 'AISmith 3D dedicated environment was not created.' }
 

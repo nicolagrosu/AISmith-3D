@@ -180,18 +180,6 @@ def prepare_trellis_input(input_image: Path) -> bytes:
     return output.getvalue()
 
 
-def skintoken_repo() -> Path:
-    return configured_path("SKINTOKEN_REPO_DIR", ROOT / "vendor" / "ComfyUI-SkinTokens")
-
-
-def skintoken_model_dir() -> Path:
-    return configured_path("SKINTOKEN_MODELS_DIR", ROOT / "studio-data" / "models" / "skintoken")
-
-
-def mesh2motion_library() -> Path:
-    return configured_path("MESH2MOTION_LIBRARY", ROOT / "vendor" / "mesh2motion-app" / "static" / "animations" / "human-base-animations.glb")
-
-
 def autoremesher_exe() -> Path | None:
     configured = os.getenv("AUTOREMESHER_EXE", "").strip()
     candidates = [Path(configured)] if configured else []
@@ -748,33 +736,6 @@ def run_trellis_fp8(input_image: Path, output_glb: Path, resolution: int, progre
     })
     run_process([sys.executable, str(worker), spec], progress=progress, timeout=7200)
     return {"backend": "trellis2-fp8", "model": "visualbruno/TRELLIS.2-4B-FP8", "resolution": actual_resolution, "textured": True}
-
-
-def run_skintoken(input_glb: Path, output_glb: Path, progress: Progress | None = None) -> dict[str, Any]:
-    blender = find_blender()
-    repo = skintoken_repo()
-    if blender is None:
-        raise RuntimeError("Blender 4.2+ is required for SkinToken rigging but was not found")
-    if not (repo / "nodes.py").exists():
-        raise RuntimeError(f"SkinToken repository is missing: {repo}")
-    worker = ROOT / "backend" / "workers" / "skintoken_worker.py"
-    spec = json.dumps({"repo": str(repo), "model_dir": str(skintoken_model_dir()), "input": str(input_glb), "output_dir": str(output_glb.parent), "output": str(output_glb)})
-    env_path = str(blender.parent) + os.pathsep + os.environ.get("PATH", "")
-    run_process([sys.executable, str(worker), "--", spec], progress=progress, timeout=3600, env={"PATH": env_path, "BLENDER_EXE": str(blender)})
-    return {"backend": "skintoken", "format": "glb", "bone_convention": "articulated"}
-
-
-def run_animate(input_glb: Path, output_glb: Path, animation: str, progress: Progress | None = None) -> dict[str, Any]:
-    blender = find_blender()
-    library = mesh2motion_library()
-    if blender is None:
-        raise RuntimeError("Blender 4.2+ is required for animation export but was not found")
-    if not library.exists():
-        raise RuntimeError(f"Mesh2Motion human animation library was not found: {library}")
-    worker = ROOT / "backend" / "workers" / "blender_worker.py"
-    spec = json.dumps({"op": "animate", "input": str(input_glb), "output": str(output_glb), "library": str(library), "animation": animation})
-    run_process([str(blender), "--background", "--factory-startup", "--python", str(worker), "--", spec], progress=progress, timeout=900)
-    return {"backend": "mesh2motion", "animation": animation, "retargeted": True, "library": str(library)}
 
 
 def run_paint(input_glb: Path, output_glb: Path, settings: dict[str, Any], progress: Progress | None = None) -> dict[str, Any]:

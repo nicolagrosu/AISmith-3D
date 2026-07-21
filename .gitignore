@@ -12,3 +12,6 @@ vendor/trellis.cpp/*.exe
 # trellis2cpp build output (compiled binaries, never commit these)
 vendor/trellis2cpp/build/
 vendor/trellis2cpp/ggufs/
+.git-vendored-source/
+vendor/ComfyUI-SkinTokens/
+vendor/mesh2motion-assets/

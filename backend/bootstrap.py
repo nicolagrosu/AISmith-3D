@@ -129,33 +129,16 @@ def download_trellis() -> None:
     print("[AISmith 3D] trellis.cpp geometry workflow is ready.")
 
 
-def download_skintoken() -> None:
-    import torch
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA PyTorch is not available for SkinToken model download")
-    from huggingface_hub import hf_hub_download, snapshot_download
-    target = Path(os.getenv("SKINTOKEN_MODELS_DIR", ROOT / "studio-data/models/skintoken")).resolve()
-    target.mkdir(parents=True, exist_ok=True)
-    print("[AISmith 3D] Downloading/verifying SkinToken checkpoints...")
-    for filename in ("experiments/skin_vae_2_10_32768/last.ckpt", "experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt"):
-        hf_hub_download(repo_id="VAST-AI/SkinTokens", filename=filename, local_dir=target)
-    snapshot_download(repo_id="Qwen/Qwen3-0.6B", local_dir=target / "models/Qwen3-0.6B", ignore_patterns=["*.bin", "*.safetensors"])
-    print("[AISmith 3D] SkinToken checkpoints are ready.")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--download-models", action="store_true")
-    parser.add_argument("--download-model", choices=("trellis-cpp", "trellis2", "skintoken", "all"))
+    parser.add_argument("--download-model", choices=("trellis-cpp", "trellis2", "all"))
     args = parser.parse_args()
     if args.download_models:
         download_trellis()
-        download_skintoken()
     elif args.download_model:
         if args.download_model in {"trellis-cpp", "trellis2", "all"}:
             download_trellis()
-        if args.download_model in {"skintoken", "all"}:
-            download_skintoken()
 
 
 if __name__ == "__main__":

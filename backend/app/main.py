@@ -42,7 +42,7 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 
 class JobRequest(BaseModel):
-    kind: Literal["generate", "retopologize", "retopo", "rig", "paint-bake", "animate"]
+    kind: Literal["generate", "retopologize", "retopo", "paint-bake"]
     source_artifact_id: str | None = None
     # 768 is AISmith 3D's balanced export preset: it runs the native 1024
     # cascade, then creates a viewport-friendly PBR asset.
@@ -51,7 +51,6 @@ class JobRequest(BaseModel):
     target_faces: int = Field(default=10000, ge=500, le=200000)
     target_vertices: int | None = Field(default=None, ge=500, le=1_000_000)
     quality: Literal["game", "balanced", "high"] = "game"
-    animation: str = "Idle"
     settings: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -260,12 +259,10 @@ downloads: dict[str, DownloadState] = {}
 
 
 def _model_readiness() -> dict[str, bool]:
-    skintoken_root = native.skintoken_model_dir()
     return {
         "trellis_cpp_ready": native.trellis_cli() is not None and native.trellis_workflow_ready(),
         # Kept for older frontend clients; it now means the C++ geometry set.
         "trellis_gguf_ready": native.trellis_cli() is not None and native.trellis_workflow_ready(),
-        "skintoken_ready": (skintoken_root / "experiments/skin_vae_2_10_32768/last.ckpt").exists() and (skintoken_root / "experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt").exists(),
         "instant_meshes_ready": native.instant_meshes_exe() is not None,
         "trellis_refiner_ready": native.trellis_refiner_ready(),
     }
@@ -489,7 +486,7 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
             return
         job.status = "running"
         _job_log(job, "Preparing native local worker", 5)
-        model_name = {"generate": "trellis-cpp", "retopologize": "trellis2-fp8", "retopo": "instant-meshes", "rig": "skintoken", "animate": "hymotion"}.get(request.kind)
+        model_name = {"generate": "trellis-cpp", "retopologize": "trellis2-fp8", "retopo": "instant-meshes"}.get(request.kind)
         if model_name:
             await model_manager.acquire(model_name)
         if job.status == "cancelled":
@@ -536,10 +533,6 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
                 target_vertices = request.target_vertices or request.target_faces
                 repair_holes = bool(request.settings.get("repair_holes", False))
                 metadata.update(await asyncio.to_thread(native.run_instant_meshes, Path(source.path), output, target_vertices, repair_holes, lambda message: _job_log(job, message, min(94, max(18, job.progress + 4)))))
-            elif request.kind == "rig":
-                metadata.update(await asyncio.to_thread(native.run_skintoken, Path(source.path), output, lambda message: _job_log(job, message, min(78, max(18, job.progress + 3)))))
-            elif request.kind == "animate":
-                metadata.update(await asyncio.to_thread(native.run_animate, Path(source.path), output, request.animation, lambda message: _job_log(job, message, min(78, max(18, job.progress + 3)))))
             elif request.kind == "paint-bake":
                 metadata.update(await asyncio.to_thread(native.run_paint, Path(source.path), output, request.settings, lambda message: _job_log(job, message, min(78, max(18, job.progress + 3)))))
             else:
@@ -575,19 +568,10 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
 async def capabilities() -> dict[str, Any]:
     gpu = _gpu_info()
     blender_path = native.find_blender()
-    skintoken_repo = native.skintoken_repo()
     readiness = _model_readiness()
     diagnostics: list[str] = []
-    if gpu["available"] and not gpu["torch_cuda_available"]:
-        diagnostics.append("NVIDIA GPU detected, but the active Python environment has CPU-only PyTorch; SkinToken requires CUDA PyTorch.")
-    if gpu["available"] and gpu["compute_capability"]:
-        try:
-            if float(str(gpu["compute_capability"])) < 8.0:
-                diagnostics.append("SkinToken requires Ampere-or-newer compute capability (8.0+).")
-        except ValueError:
-            pass
     if blender_path is None:
-        diagnostics.append("Blender 4.2+ was not found; GLB conversion, texture baking, rigging, and animation export are unavailable.")
+        diagnostics.append("Blender 4.2+ was not found; GLB conversion and texture baking are unavailable.")
     return {
         "platform": platform.platform(),
         "python": sys.version.split()[0],
@@ -602,9 +586,6 @@ async def capabilities() -> dict[str, Any]:
             "trellis2_native": native.trellis_cli() is not None,
             "instant_meshes_native": native.instant_meshes_exe() is not None,
             "trellis_refiner_ready": readiness["trellis_refiner_ready"],
-            "skintoken_native": (skintoken_repo / "nodes.py").exists(),
-            "skintoken_ready": readiness["skintoken_ready"],
-            "mesh2motion_native": native.mesh2motion_library().exists(),
         },
         "diagnostics": diagnostics,
         "downloads": {download_id: state.as_dict() for download_id, state in downloads.items() if state.status in {"queued", "running"}},
@@ -645,8 +626,6 @@ async def create_job(request: JobRequest, background_tasks: BackgroundTasks) -> 
     if request.kind == "generate":
         if not readiness["trellis_cpp_ready"]:
             raise HTTPException(status_code=409, detail="The trellis.cpp geometry workflow is not downloaded. Open Generate and download it before starting inference.")
-    if request.kind == "rig" and not readiness["skintoken_ready"]:
-        raise HTTPException(status_code=409, detail="SkinToken checkpoints are not downloaded. Open the Auto Rig tab and download them before starting rigging.")
     if request.kind == "retopologize" and not readiness["trellis_refiner_ready"]:
         raise HTTPException(status_code=409, detail="TRELLIS.2 FP8 Refine is not downloaded. Open Refine and download it before starting.")
     if request.kind == "retopo" and not readiness["instant_meshes_ready"]:
@@ -667,18 +646,14 @@ async def list_downloads() -> list[dict[str, Any]]:
 
 @app.post("/api/models/{name}/download", response_model=DownloadState)
 async def download_model(name: str, background_tasks: BackgroundTasks) -> DownloadState:
-    if name not in {"trellis-cpp", "trellis2", "skintoken", "instant-meshes", "trellis-refiner"}:
+    if name not in {"trellis-cpp", "trellis2", "instant-meshes", "trellis-refiner"}:
         raise HTTPException(status_code=404, detail="This tab has no downloadable model package")
     gpu = _gpu_info()
-    if name == "skintoken" and not gpu["native_inference_ready"]:
-        raise HTTPException(status_code=400, detail="CUDA-enabled PyTorch is not ready. Run start.ps1 -Install before downloading GPU models.")
     readiness = _model_readiness()
     if name in {"trellis2", "trellis-refiner"}:
         ready = readiness["trellis_refiner_ready"]
     elif name == "trellis-cpp":
         ready = readiness["trellis_cpp_ready"]
-    elif name == "skintoken":
-        ready = readiness["skintoken_ready"]
     else:
         ready = readiness["instant_meshes_ready"]
     if ready:

@@ -11,10 +11,12 @@
   "dependencies": {
     "@google/model-viewer": "^4.3.1",
     "@vitejs/plugin-react": "latest",
+    "jszip": "^3.10.1",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
     "three": "latest",
+    "tippy.js": "^6.3.7",
     "typescript": "latest",
     "vite": "latest"
   },
