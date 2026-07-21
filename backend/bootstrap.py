@@ -27,7 +27,7 @@ class AISmithDownloadProgress(BaseTqdm):
 
     file_name = ""
     file_index = 0
-    file_count = 10
+    file_count = 7
 
     def __init__(self, *args, **kwargs):
         kwargs["disable"] = True
@@ -77,17 +77,21 @@ def download_release(url: str, destination: Path) -> None:
 
 
 def trellis_gguf_manifest() -> list[tuple[str, str, str]]:
-    """Full geometry and PBR texture bundle for the standalone trellis.cpp runtime."""
+    """Geometry-only bundle for the standalone trellis.cpp generator.
+
+    The app invokes trellis.cpp with ``--no-texture``.  Final PBR texturing is
+    performed by the FP8 refinement worker, so downloading the three C++
+    texture GGUFs would only consume disk space.
+    """
     filenames = (
         "birefnet.gguf", "dinov3.gguf", "shape_dec.gguf", "shape_flow_512.gguf",
-        "shape_flow_1024.gguf", "ss_dec.gguf", "ss_flow.gguf", "tex_dec.gguf",
-        "tex_flow_512.gguf", "tex_flow_1024.gguf",
+        "shape_flow_1024.gguf", "ss_dec.gguf", "ss_flow.gguf",
     )
     return [(TRELLIS_CPP_MODELS, filename, filename) for filename in filenames]
 
 
 def download_model_files(model_root: Path) -> None:
-    """Fetch the standalone geometry-and-texture bundle file-by-file."""
+    """Fetch the standalone geometry bundle file-by-file."""
     from huggingface_hub import hf_hub_download
 
     manifest = trellis_gguf_manifest()
@@ -116,13 +120,13 @@ def download_trellis() -> None:
         raise RuntimeError("An NVIDIA GPU is required for the Trellis2 CUDA workflow")
     model_root = ROOT / "studio-data" / "models" / "trellis-cpp"
     model_root.mkdir(parents=True, exist_ok=True)
-    print("[AISmith 3D] Downloading the Trellis2 geometry + PBR texture workflow one file at a time...")
+    print("[AISmith 3D] Downloading the trellis.cpp geometry workflow one file at a time...")
     download_model_files(model_root)
     missing = [model_root / relative for _, _, relative in trellis_gguf_manifest() if not (model_root / relative).is_file()]
     if missing:
         formatted = "\n  - ".join(path.name for path in missing)
         raise RuntimeError(f"Trellis2 model download is incomplete. Missing:\n  - {formatted}")
-    print("[AISmith 3D] Trellis2 geometry + PBR texture workflow is ready.")
+    print("[AISmith 3D] trellis.cpp geometry workflow is ready.")
 
 
 def download_skintoken() -> None:
@@ -142,13 +146,13 @@ def download_skintoken() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--download-models", action="store_true")
-    parser.add_argument("--download-model", choices=("trellis2", "skintoken", "all"))
+    parser.add_argument("--download-model", choices=("trellis-cpp", "trellis2", "skintoken", "all"))
     args = parser.parse_args()
     if args.download_models:
         download_trellis()
         download_skintoken()
     elif args.download_model:
-        if args.download_model in {"trellis2", "all"}:
+        if args.download_model in {"trellis-cpp", "trellis2", "all"}:
             download_trellis()
         if args.download_model in {"skintoken", "all"}:
             download_skintoken()

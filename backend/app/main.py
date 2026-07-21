@@ -36,15 +36,18 @@ for directory in (UPLOADS, ARTIFACTS, JOBS_DIR, DOWNLOADS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_UPLOADS = {"png", "jpg", "jpeg", "webp", "glb", "gltf", "fbx", "obj"}
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+# Generated GLBs commonly exceed 20 MB once they carry PBR textures. Keep a
+# bounded local-import limit, but allow normal studio assets to round-trip.
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 
 class JobRequest(BaseModel):
-    kind: Literal["generate", "retopologize", "rig", "paint-bake", "animate"]
+    kind: Literal["generate", "retopologize", "retopo", "rig", "paint-bake", "animate"]
     source_artifact_id: str | None = None
     # 768 is AISmith 3D's balanced export preset: it runs the native 1024
     # cascade, then creates a viewport-friendly PBR asset.
     resolution: Literal[512, 768, 1024] = 768
+    seed: int = Field(default=0, ge=0, le=2_147_483_647)
     target_faces: int = Field(default=10000, ge=500, le=200000)
     target_vertices: int | None = Field(default=None, ge=500, le=1_000_000)
     quality: Literal["game", "balanced", "high"] = "game"
@@ -190,10 +193,35 @@ def _gpu_info() -> dict[str, Any]:
             info.update({"available": True, "name": properties.name, "vram_total_mb": round(properties.total_memory / 1024 / 1024), "cuda": True, "torch_cuda_available": True, "compute_capability": f"{properties.major}.{properties.minor}"})
     except Exception:
         pass
-    info["model_variant"] = "GGUF CUDA"
+    info["model_variant"] = "C++ Generate + TRELLIS.2 FP8 Refine"
     info["recommended_resolution"] = 512 if info["vram_total_mb"] <= 8192 else 1024
     info["native_inference_ready"] = bool(info["available"] and info["torch_cuda_available"] and info["compute_capability"])
     return info
+
+
+def _ram_info() -> dict[str, int]:
+    """System RAM snapshot for the local-only status bar."""
+    try:
+        import ctypes
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatus()
+        status.dwLength = ctypes.sizeof(status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            total_mb = round(status.ullTotalPhys / 1024 / 1024)
+            available_mb = round(status.ullAvailPhys / 1024 / 1024)
+            return {"total_mb": total_mb, "used_mb": max(0, total_mb - available_mb)}
+    except Exception:
+        pass
+    return {"total_mb": 0, "used_mb": 0}
 
 
 class ModelManager:
@@ -234,8 +262,9 @@ downloads: dict[str, DownloadState] = {}
 def _model_readiness() -> dict[str, bool]:
     skintoken_root = native.skintoken_model_dir()
     return {
-        "trellis_cpp_ready": native.trellis_workflow_ready(),
-        "trellis_gguf_ready": native.trellis_workflow_ready(),
+        "trellis_cpp_ready": native.trellis_cli() is not None and native.trellis_workflow_ready(),
+        # Kept for older frontend clients; it now means the C++ geometry set.
+        "trellis_gguf_ready": native.trellis_cli() is not None and native.trellis_workflow_ready(),
         "skintoken_ready": (skintoken_root / "experiments/skin_vae_2_10_32768/last.ckpt").exists() and (skintoken_root / "experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt").exists(),
         "instant_meshes_ready": native.instant_meshes_exe() is not None,
         "trellis_refiner_ready": native.trellis_refiner_ready(),
@@ -255,7 +284,7 @@ def _run_model_download(state: DownloadState) -> None:
     if state.model == "instant-meshes":
         _run_instant_meshes_download(state)
         return
-    if state.model == "trellis-refiner":
+    if state.model in {"trellis2", "trellis-refiner"}:
         _run_trellis_refiner_download(state)
         return
     command = [sys.executable, "-u", "-m", "backend.bootstrap", "--download-model", state.model]
@@ -397,21 +426,27 @@ def _run_trellis_refiner_download(state: DownloadState) -> None:
         completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=1800)
         if completed.returncode != 0:
             raise RuntimeError(f"Could not install TRELLIS.2 refiner dependencies: {(completed.stdout + completed.stderr)[-1200:]}")
-        _download_log(state, "Downloading FP8 TRELLIS.2 refinement models", 35)
+        _download_log(state, "Downloading TRELLIS.2 FP8 refinement and PBR models", 35)
         from huggingface_hub import snapshot_download
         models = runtime / "models"
         for index, repo in enumerate((
             "visualbruno/TRELLIS.2-4B-FP8",
             "facebook/dinov3-vitl16-pretrain-lvd1689m",
-            "microsoft/TRELLIS-image-large",
         ), start=1):
-            state.file_name, state.file_index, state.file_count = repo, index, 3
-            _download_log(state, f"Downloading {repo}", 35 + index * 15)
+            state.file_name, state.file_index, state.file_count = repo, index, 2
+            _download_log(state, f"Downloading {repo}", 35 + index * 25)
             snapshot_download(repo_id=repo, local_dir=models / repo, local_dir_use_symlinks=False)
+        # The wrapper requires the sparse-structure decoder but not the full
+        # 3-GB legacy TRELLIS-image-large repository.
+        state.file_name, state.file_index, state.file_count = "TRELLIS-image-large decoder", 3, 3
+        _download_log(state, "Downloading required TRELLIS image decoder", 88)
+        from huggingface_hub import hf_hub_download
+        for filename in ("ckpts/ss_dec_conv3d_16l8_fp16.json", "ckpts/ss_dec_conv3d_16l8_fp16.safetensors"):
+            hf_hub_download(repo_id="microsoft/TRELLIS-image-large", filename=filename, local_dir=models / "microsoft" / "TRELLIS-image-large")
         if not native.trellis_refiner_ready():
             raise RuntimeError("The TRELLIS.2 refiner download did not contain all required model files")
         state.status = "completed"
-        _download_log(state, "AI Refine is ready", 100)
+        _download_log(state, "TRELLIS.2 FP8 Refine is ready", 100)
     except Exception as exc:
         state.status = "failed"
         state.error = str(exc)
@@ -433,13 +468,13 @@ def _job_log(job: JobState, message: str, progress: int | None = None) -> None:
 
 
 def _trellis_job_progress(message: str, current: int) -> int:
-    """Map direct GGUF workflow stages to useful, non-jumping progress."""
+    """Map one-shot FP8 worker logs to useful, non-jumping progress."""
     xatlas = re.search(r"xatlas: Computing charts:\s+(\d{1,3})%", message, re.IGNORECASE)
     if xatlas:
         # UV charting is the long CPU-bound section after the model stages.
         # Surface its own progress instead of pinning the UI at 78%.
         return min(92, 78 + round(int(xatlas.group(1)) * 14 / 100))
-    stage_values = {"Loading Trellis": 14, "Removing background": 20, "stage 1/5": 30, "stage 2/5": 42, "stage 3/5": 56, "stage 4/5": 68, "stage 5/5": 77, "Remeshing": 80, "Exported": 94}
+    stage_values = {"Loading TRELLIS": 14, "Generating": 30, "Refining geometry": 30, "Reconstructing": 55, "Simplifying": 65, "Filling holes": 70, "Generating PBR": 78, "Exporting": 94, "job complete": 96}
     for marker, value in stage_values.items():
         if marker in message:
             return value
@@ -450,11 +485,15 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
     source = read_artifact(request.source_artifact_id) if request.source_artifact_id else None
     model_name: str | None = None
     try:
+        if job.status == "cancelled":
+            return
         job.status = "running"
         _job_log(job, "Preparing native local worker", 5)
-        model_name = {"generate": "trellis2", "rig": "skintoken", "animate": "hymotion"}.get(request.kind)
+        model_name = {"generate": "trellis-cpp", "retopologize": "trellis2-fp8", "retopo": "instant-meshes", "rig": "skintoken", "animate": "hymotion"}.get(request.kind)
         if model_name:
             await model_manager.acquire(model_name)
+        if job.status == "cancelled":
+            return
 
         output = ARTIFACTS / f"job-{job.id}.glb"
         metadata = {"stage": request.kind, "settings": request.settings, "native": True, "worker_isolated": True}
@@ -469,34 +508,34 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
             if source is None or source.kind not in {"image", "png", "jpg", "jpeg", "webp"}:
                 raise ValueError("Generate requires a single uploaded image")
             mode_name = "fast" if request.resolution == 512 else "high-detail"
-            _job_log(job, f"Selected Trellis2 standalone workflow in {mode_name} mode", 12)
-            result = await asyncio.to_thread(native.run_trellis, Path(source.path), output, request.resolution, lambda message: _job_log(job, message, _trellis_job_progress(message, job.progress)))
+            _job_log(job, f"Selected alpha-aware C++ geometry workflow in {mode_name} mode", 12)
+            result = await asyncio.to_thread(native.run_trellis, Path(source.path), output, request.resolution, request.seed, lambda message: _job_log(job, message, _trellis_job_progress(message, job.progress)))
             metadata.update(result)
         elif source:
             _job_log(job, f"Loading {source.name} into the {request.kind} worker", 15)
             if request.kind == "retopologize":
                 target_vertices = request.target_vertices or request.target_faces
                 repair_holes = bool(request.settings.get("repair_holes", False))
-                method = str(request.settings.get("retopo_method", "instant-meshes"))
-                if method == "ai-refine":
-                    # An explicitly attached image is required for imported GLBs
-                    # and intentionally takes precedence over inherited Generate
-                    # provenance for a user who wants to refine against another view.
-                    image_id = str(request.settings.get("refine_image_artifact_id") or source.metadata.get("source_image_artifact_id") or "")
-                    if not image_id:
-                        parent_id = str(source.metadata.get("source_artifact_id") or "")
-                        if parent_id:
-                            parent = read_artifact(parent_id)
-                            image_id = str(parent.metadata.get("source_image_artifact_id") or (parent.id if parent.kind == "image" else ""))
-                    if not image_id:
-                        raise ValueError("AI Refine requires a GLB generated from this app so its original reference image is available.")
-                    image = read_artifact(image_id)
-                    if image.kind != "image":
-                        raise ValueError("The retained AI Refine reference is not an image artifact.")
-                    metadata["source_image_artifact_id"] = image.id
-                    metadata.update(await asyncio.to_thread(native.run_trellis_ai_refine, Path(source.path), Path(image.path), output, target_vertices, lambda message: _job_log(job, message, min(94, max(18, job.progress + 4)))))
-                else:
-                    metadata.update(await asyncio.to_thread(native.run_instant_meshes, Path(source.path), output, target_vertices, repair_holes, lambda message: _job_log(job, message, min(94, max(18, job.progress + 4)))))
+                gpu_first = bool(request.settings.get("gpu_first", False))
+                # An explicitly attached image is required for imported GLBs and
+                # takes precedence over Generate provenance.
+                image_id = str(request.settings.get("refine_image_artifact_id") or source.metadata.get("source_image_artifact_id") or "")
+                if not image_id:
+                    parent_id = str(source.metadata.get("source_artifact_id") or "")
+                    if parent_id:
+                        parent = read_artifact(parent_id)
+                        image_id = str(parent.metadata.get("source_image_artifact_id") or (parent.id if parent.kind == "image" else ""))
+                if not image_id:
+                    raise ValueError("Refine & Reconstruct requires a reference image. Attach one for imported GLBs.")
+                image = read_artifact(image_id)
+                if image.kind != "image":
+                    raise ValueError("The retained refinement reference is not an image artifact.")
+                metadata["source_image_artifact_id"] = image.id
+                metadata.update(await asyncio.to_thread(native.run_trellis_ai_refine, Path(source.path), Path(image.path), output, target_vertices, repair_holes, gpu_first, lambda message: _job_log(job, message, min(94, max(18, job.progress + 4)))))
+            elif request.kind == "retopo":
+                target_vertices = request.target_vertices or request.target_faces
+                repair_holes = bool(request.settings.get("repair_holes", False))
+                metadata.update(await asyncio.to_thread(native.run_instant_meshes, Path(source.path), output, target_vertices, repair_holes, lambda message: _job_log(job, message, min(94, max(18, job.progress + 4)))))
             elif request.kind == "rig":
                 metadata.update(await asyncio.to_thread(native.run_skintoken, Path(source.path), output, lambda message: _job_log(job, message, min(78, max(18, job.progress + 3)))))
             elif request.kind == "animate":
@@ -521,6 +560,9 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
         job.error = "Job cancelled"
         _job_log(job, job.error)
     except Exception as exc:
+        if job.status == "cancelled":
+            _job_log(job, "Cancelled")
+            return
         job.status = "failed"
         job.error = str(exc)
         _job_log(job, f"Failed: {exc}")
@@ -533,7 +575,6 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
 async def capabilities() -> dict[str, Any]:
     gpu = _gpu_info()
     blender_path = native.find_blender()
-    instant_meshes = native.instant_meshes_exe()
     skintoken_repo = native.skintoken_repo()
     readiness = _model_readiness()
     diagnostics: list[str] = []
@@ -545,8 +586,6 @@ async def capabilities() -> dict[str, Any]:
                 diagnostics.append("SkinToken requires Ampere-or-newer compute capability (8.0+).")
         except ValueError:
             pass
-    if instant_meshes is None:
-        diagnostics.append("Instant Meshes is not installed. Open Retopologize and download its Windows bundle.")
     if blender_path is None:
         diagnostics.append("Blender 4.2+ was not found; GLB conversion, texture baking, rigging, and animation export are unavailable.")
     return {
@@ -554,13 +593,14 @@ async def capabilities() -> dict[str, Any]:
         "python": sys.version.split()[0],
         "environment": {"python_executable": sys.executable, "dedicated": str(ROOT / ".venv") in sys.executable},
         "gpu": gpu,
+        "ram": _ram_info(),
         "blender": {"command": str(blender_path or "blender"), "available": blender_path is not None, "minimum_version": "4.2"},
         "models": {
-            "trellis_cpp": False,
+            "trellis_cpp": native.trellis_cli() is not None,
             "trellis_cpp_ready": readiness["trellis_cpp_ready"],
             "trellis_gguf_ready": readiness["trellis_gguf_ready"],
-            "trellis2_native": readiness["trellis_gguf_ready"],
-            "instant_meshes_native": instant_meshes is not None,
+            "trellis2_native": native.trellis_cli() is not None,
+            "instant_meshes_native": native.instant_meshes_exe() is not None,
             "trellis_refiner_ready": readiness["trellis_refiner_ready"],
             "skintoken_native": (skintoken_repo / "nodes.py").exists(),
             "skintoken_ready": readiness["skintoken_ready"],
@@ -581,13 +621,19 @@ async def upload_asset(file: UploadFile = File(...)) -> Artifact:
         raise HTTPException(status_code=415, detail=f"Unsupported file type. Use: {', '.join(sorted(ALLOWED_UPLOADS))}")
     destination = UPLOADS / f"{uuid.uuid4().hex}-{name}"
     total = 0
+    exceeded_limit = False
     with destination.open("wb") as handle:
         while chunk := await file.read(1024 * 1024):
             total += len(chunk)
             if total > MAX_UPLOAD_BYTES:
-                destination.unlink(missing_ok=True)
-                raise HTTPException(status_code=413, detail="Upload exceeds 20 MB")
+                exceeded_limit = True
+                break
             handle.write(chunk)
+    if exceeded_limit:
+        # On Windows the file cannot be removed from inside its active ``with``
+        # block; close it first so a size rejection remains a clean 413 error.
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail="Upload exceeds 100 MB")
     return save_artifact(destination, name=name, kind="image" if suffix in {"png", "jpg", "jpeg", "webp"} else suffix, metadata={"source": "upload"})
 
 
@@ -598,13 +644,13 @@ async def create_job(request: JobRequest, background_tasks: BackgroundTasks) -> 
     readiness = _model_readiness()
     if request.kind == "generate":
         if not readiness["trellis_cpp_ready"]:
-            raise HTTPException(status_code=409, detail="The Trellis2 geometry and texture workflow is not downloaded. Open the Generate tab and download it before starting inference.")
+            raise HTTPException(status_code=409, detail="The trellis.cpp geometry workflow is not downloaded. Open Generate and download it before starting inference.")
     if request.kind == "rig" and not readiness["skintoken_ready"]:
         raise HTTPException(status_code=409, detail="SkinToken checkpoints are not downloaded. Open the Auto Rig tab and download them before starting rigging.")
-    if request.kind == "retopologize" and not readiness["instant_meshes_ready"]:
-        raise HTTPException(status_code=409, detail="Instant Meshes is not downloaded. Open Retopologize and download the engine before starting.")
-    if request.kind == "retopologize" and request.settings.get("retopo_method") == "ai-refine" and not readiness["trellis_refiner_ready"]:
-        raise HTTPException(status_code=409, detail="AI Refine is not downloaded. Open Retopologize and download the TRELLIS.2 FP8 refiner before starting.")
+    if request.kind == "retopologize" and not readiness["trellis_refiner_ready"]:
+        raise HTTPException(status_code=409, detail="TRELLIS.2 FP8 Refine is not downloaded. Open Refine and download it before starting.")
+    if request.kind == "retopo" and not readiness["instant_meshes_ready"]:
+        raise HTTPException(status_code=409, detail="Instant Meshes is not downloaded. Open Retopology and download it before starting.")
     if request.kind != "generate" and not request.source_artifact_id:
         raise HTTPException(status_code=400, detail=f"{request.kind} requires source_artifact_id")
     job = JobState(id=uuid.uuid4().hex, kind=request.kind)
@@ -621,18 +667,18 @@ async def list_downloads() -> list[dict[str, Any]]:
 
 @app.post("/api/models/{name}/download", response_model=DownloadState)
 async def download_model(name: str, background_tasks: BackgroundTasks) -> DownloadState:
-    if name not in {"trellis2", "skintoken", "instant-meshes", "trellis-refiner"}:
+    if name not in {"trellis-cpp", "trellis2", "skintoken", "instant-meshes", "trellis-refiner"}:
         raise HTTPException(status_code=404, detail="This tab has no downloadable model package")
     gpu = _gpu_info()
     if name == "skintoken" and not gpu["native_inference_ready"]:
         raise HTTPException(status_code=400, detail="CUDA-enabled PyTorch is not ready. Run start.ps1 -Install before downloading GPU models.")
     readiness = _model_readiness()
-    if name == "trellis2":
+    if name in {"trellis2", "trellis-refiner"}:
+        ready = readiness["trellis_refiner_ready"]
+    elif name == "trellis-cpp":
         ready = readiness["trellis_cpp_ready"]
     elif name == "skintoken":
         ready = readiness["skintoken_ready"]
-    elif name == "trellis-refiner":
-        ready = readiness["trellis_refiner_ready"]
     else:
         ready = readiness["instant_meshes_ready"]
     if ready:
@@ -670,6 +716,24 @@ async def get_job(job_id: str) -> JobState:
     return jobs[job_id]
 
 
+@app.post("/api/jobs/{job_id}/cancel", response_model=JobState)
+async def cancel_job(job_id: str) -> JobState:
+    job = jobs.get(job_id)
+    if job is None:
+        stored = JOBS_DIR / f"{job_id}.json"
+        if not stored.exists():
+            raise HTTPException(status_code=404, detail="Job not found")
+        job = JobState(**_read_json(stored))
+        jobs[job_id] = job
+    if job.status not in {"queued", "running"}:
+        return job
+    job.status = "cancelled"
+    job.error = "Cancelled by user"
+    native.cancel_active_process()
+    _job_log(job, "Cancelling task")
+    return job
+
+
 @app.post("/api/models/{name}/unload")
 async def unload_model(name: str) -> dict[str, Any]:
     if model_manager.loaded and (name == "all" or name == model_manager.loaded):
@@ -686,6 +750,14 @@ async def clear_memory() -> dict[str, Any]:
     else:
         gc.collect()
     return {"ok": True, "message": "GPU cache and Python references cleared.", "gpu": _gpu_info()}
+
+
+@app.post("/api/system/clear-ram")
+async def clear_ram() -> dict[str, Any]:
+    if model_manager.lock.locked():
+        return {"ok": False, "message": "A job is running; RAM is released when it completes.", "ram": _ram_info()}
+    gc.collect()
+    return {"ok": True, "message": "AISmith idle Python memory cleared.", "ram": _ram_info()}
 
 
 @app.post("/api/system/output-location/select")

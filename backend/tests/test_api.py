@@ -20,12 +20,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(client.get("/api/health").json()["status"], "ok")
         payload = client.get("/api/system/capabilities").json()
         self.assertIn("gpu", payload)
-        self.assertEqual(payload["gpu"]["model_variant"], "GGUF CUDA")
+        self.assertEqual(payload["gpu"]["model_variant"], "C++ Generate + TRELLIS.2 FP8 Refine")
 
 
-    def test_trellis_cpp_requires_all_native_ggufs(self):
+    def test_trellis_cpp_requires_geometry_ggufs_only(self):
         files = {path.name for path in native.trellis_model_files()}
-        self.assertEqual(files, {"birefnet.gguf", "dinov3.gguf", "shape_dec.gguf", "shape_flow_512.gguf", "shape_flow_1024.gguf", "ss_dec.gguf", "ss_flow.gguf", "tex_dec.gguf", "tex_flow_512.gguf", "tex_flow_1024.gguf"})
+        self.assertEqual(files, {"birefnet.gguf", "dinov3.gguf", "shape_dec.gguf", "shape_flow_512.gguf", "shape_flow_1024.gguf", "ss_dec.gguf", "ss_flow.gguf"})
 
     def test_trellis_downloader_matches_standalone_runtime(self):
         downloaded = {local for _, _, local in bootstrap.trellis_gguf_manifest()}

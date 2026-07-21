@@ -2,14 +2,16 @@
 
 AISmith 3D is a Windows-local React/FastAPI studio for the complete pipeline:
 
-`single image → trellis.cpp GGUF → GLB → AutoRemesher → SkinToken → Mesh2Motion animation`
+The active hybrid workflow is: single image -> trellis.cpp geometry GLB -> TRELLIS.2 FP8 refine/reconstruct/PBR -> SkinToken -> Mesh2Motion animation.
 
-The application does not use ComfyUI as its frontend or runtime. Image-to-3D runs through the standalone CUDA build of `pwilkin/trellis.cpp`; it owns background removal, model loading, mesh extraction, texture baking, and GLB export. The remaining stages use AutoRemesher, SkinToken, and short-lived headless Blender processes.
+`single image → TRELLIS.2 FP8 → PBR GLB → TRELLIS.2 refine/reconstruct → SkinToken → Mesh2Motion animation`
+
+The application does not use ComfyUI as its frontend. Generate uses the bundled trellis.cpp CUDA executable for the alpha-aware C++ workflow. Refine invokes the TRELLIS.2 FP8 Python nodes directly in a short-lived, isolated worker for mesh-conditioned refinement, reconstruction, and PBR texturing without exposing a ComfyUI server.
 
 ## What is implemented
 
-- Generate: native `trellis-cli.exe` with the complete `ilintar/trellis2-gguf` model set, BiRefNet background removal, 512/1024 selection, UV-textured GLB export, and process exit for VRAM release.
-- Retopologize: GLB/GLTF/FBX/OBJ conversion to AutoRemesher's OBJ CLI boundary, target quad count and quality settings, then conversion back to GLB.
+- Generate: standalone trellis.cpp CUDA geometry worker with alpha-aware transparent 1024 input padding, 512/1024 selection, and `--no-texture`. The C++ texture GGUFs are intentionally not downloaded.
+- Refine: image + mesh-conditioned TRELLIS.2 refinement, CuMesh surface reconstruction, target-face simplification, optional Meshlib hole repair, then TRELLIS.2 PBR texturing on the final mesh. No Instant Meshes or Blender source-texture bake participates in this path.
 - Auto Rig: direct SkinToken model loader/generator, headless Blender path, articulated bone convention, and GLB output. No ComfyUI workflow is required.
 - Texture Paint: browser brush canvas plus material controls; Blender creates UVs when necessary, bakes UV-space strokes to a packed base-color texture, and exports a GLB.
 - Animate: Mesh2Motion's bundled human animation GLB is used as the clip library. Idle/Walk/Run/Wave actions are mapped onto the SkinToken articulated skeleton; incompatible skeletons fail instead of exporting corrupted animation.
@@ -18,9 +20,9 @@ The application does not use ComfyUI as its frontend or runtime. Image-to-3D run
 
 ## Requirements
 
-For image-to-3D: Windows 10/11, an NVIDIA GPU with current drivers, and about 17 GB of free disk space. `trellis.cpp` downloads its CUDA runtime and one complete 16.5-GB GGUF set; it is not the incompatible Q4/Q8 ComfyUI package. On 8-GB GPUs AISmith 3D permits the lightweight 512 path only. CUDA PyTorch remains required for SkinToken.
+For image-to-3D and refinement: Windows 10/11 and an NVIDIA GPU with current drivers. Generate downloads roughly 9.6 GB of trellis.cpp geometry GGUFs. Refine downloads roughly 8.8 GB for `visualbruno/TRELLIS.2-4B-FP8`, DINOv3, and its required sparse decoder. The formats are different and cannot share weights, so the full hybrid install is roughly 18.4 GB. The C++ Generate worker runs at 512 or 1024; Refine is fixed at its 1024 high-quality workflow.
 
-Blender 4.2+ is required for native conversion, texture export, SkinToken, and animation. The setup script detects it and uses winget to install it when available. AutoRemesher must be built as `autoremesher.exe` with its Qt/MSVC toolchain; the source is included under `vendor/autoremesher` but the binary is not checked in because it is not a pip-installable dependency.
+Blender 4.2+ is required for Texture Paint, SkinToken, and animation. The setup script detects it and uses winget to install it when available.
 
 The current development machine has no NVIDIA GPU and CPU-only PyTorch. Therefore the native Trellis2/SkinToken inference paths are implemented but cannot be executed on this machine; they return a clear CUDA setup error. Blender texture baking and Mesh2Motion retargeting have been exercised locally.
 
@@ -30,7 +32,7 @@ The current development machine has no NVIDIA GPU and CPU-only PyTorch. Therefor
 .\start.ps1 -Install
 ```
 
-`-Install` creates `.venv` inside the project. The launcher always starts the API with that interpreter, detects NVIDIA hardware with `nvidia-smi`, and installs the Python dependencies needed for SkinToken and the rest of the studio. trellis.cpp is installed as a separate native CUDA runtime when the Generate tab downloads its models; it does not depend on Python, ComfyUI, PyTorch SDPA, or FlashAttention. Large model downloads are runtime-gated and shown in the bottom-right download dock.
+`-Install` creates `.venv` inside the project. The launcher always starts the API with that interpreter, detects NVIDIA hardware with `nvidia-smi`, and installs the Python dependencies needed for the studio. Generate downloads its C++ geometry-only bundle on demand. Refine installs its matching CUDA extensions and downloads the FP8 model set separately on demand. Large model downloads are runtime-gated and shown in the bottom-right download dock.
 
 If an older AISmith 3D API is already listening on port 8000, use `./start.ps1 -RestartApi` to replace it with the dedicated-environment API. The launcher checks for FastAPI, Uvicorn, and PyTorch inside `.venv`; an incomplete environment is repaired automatically.
 
@@ -39,21 +41,14 @@ Then open [http://127.0.0.1:5173](http://127.0.0.1:5173).
 Copy `.env.example` to `.env` or set the variables in the process environment. Important paths are:
 
 ```text
-TRELLIS_CPP_DIR=vendor/trellis.cpp
-TRELLIS_CPP_MODEL_DIR=studio-data/models/trellis-cpp
-TRELLIS_CPP_EXE=C:/path/to/trellis-cli.exe
+TRELLIS_REFINER_DIR=studio-data/tools/trellis2-refiner
 SKINTOKEN_REPO_DIR=vendor/ComfyUI-SkinTokens
 SKINTOKEN_MODELS_DIR=studio-data/models/skintoken
-AUTOREMESHER_EXE=C:/path/to/autoremesher.exe
 MESH2MOTION_LIBRARY=vendor/mesh2motion-app/static/animations/human-base-animations.glb
 BLENDER_EXE=C:/Program Files/Blender Foundation/Blender 5.1/blender.exe
 ```
 
-The Generate tab downloads trellis.cpp's Windows CUDA release plus its full GGUF model set when the user requests it. Auto Rig downloads SkinToken checkpoints only when requested. AutoRemesher remains the one non-Python dependency: its Windows Qt/MSVC executable must be built or supplied because it is not safely distributable through pip.
-
-## Native AutoRemesher build boundary
-
-The backend calls the upstream CLI with `--input`, `--output`, `--report`, `--target-quads`, `--edge-scaling`, `--sharp-edge`, `--smooth-normal`, and `--adaptivity`. Follow `vendor/autoremesher/README.md` to build the Windows release, then set `AUTOREMESHER_EXE`. A missing executable is reported in the job error; the source mesh is never silently returned as a fake remesh.
+The Generate tab downloads the alpha-aware C++ geometry bundle when requested. The Refine tab downloads its isolated FP8 CUDA runtime and image+mesh refinement/PBR weights when requested. Auto Rig downloads SkinToken checkpoints only when requested.
 
 ## API
 

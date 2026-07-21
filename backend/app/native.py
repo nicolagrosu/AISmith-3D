@@ -14,6 +14,24 @@ from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[2]
 Progress = Callable[[str], None]
+_ACTIVE_PROCESS_LOCK = threading.Lock()
+_ACTIVE_PROCESS: subprocess.Popen[str] | None = None
+
+
+def _set_active_process(process: subprocess.Popen[str] | None) -> None:
+    global _ACTIVE_PROCESS
+    with _ACTIVE_PROCESS_LOCK:
+        _ACTIVE_PROCESS = process
+
+
+def cancel_active_process() -> bool:
+    """Stop only the currently running AISmith child worker, if any."""
+    with _ACTIVE_PROCESS_LOCK:
+        process = _ACTIVE_PROCESS
+    if process is None or process.poll() is not None:
+        return False
+    process.terminate()
+    return True
 
 
 def configured_path(name: str, default: Path) -> Path:
@@ -98,11 +116,10 @@ def trellis_gguf_ready() -> bool:
 
 
 def trellis_model_files() -> list[Path]:
-    """Complete model set required by the standalone trellis.cpp runtime."""
+    """Geometry model set used by the standalone trellis.cpp generator."""
     return [trellis_model_dir() / filename for filename in (
         "birefnet.gguf", "dinov3.gguf", "shape_dec.gguf", "shape_flow_512.gguf",
-        "shape_flow_1024.gguf", "ss_dec.gguf", "ss_flow.gguf", "tex_dec.gguf",
-        "tex_flow_512.gguf", "tex_flow_1024.gguf",
+        "shape_flow_1024.gguf", "ss_dec.gguf", "ss_flow.gguf",
     )]
 
 
@@ -207,11 +224,12 @@ def trellis_refiner_dir() -> Path:
 
 
 def trellis_refiner_ready() -> bool:
+    """Whether the isolated FP8 TRELLIS.2 refinement runtime is ready."""
     runtime = trellis_refiner_dir()
     return all(path.exists() for path in (
         runtime / "ComfyUI" / "folder_paths.py",
         runtime / "ComfyUI" / "custom_nodes" / "ComfyUI-Trellis2" / "nodes.py",
-        runtime / "models" / "visualbruno" / "TRELLIS.2-4B-FP8",
+        runtime / "models" / "visualbruno" / "TRELLIS.2-4B-FP8" / "pipeline_fp8.json",
         runtime / "models" / "facebook" / "dinov3-vitl16-pretrain-lvd1689m" / "model.safetensors",
         runtime / "models" / "microsoft" / "TRELLIS-image-large" / "ckpts" / "ss_dec_conv3d_16l8_fp16.safetensors",
     ))
@@ -223,14 +241,35 @@ def run_process(command: list[str], *, cwd: Path = ROOT, timeout: int = 3600, pr
     merged = os.environ.copy()
     if env:
         merged.update(env)
-    completed = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=merged)
-    output = (completed.stdout + "\n" + completed.stderr).strip()
-    if progress:
-        for line in output.splitlines()[-12:]:
-            if line.strip():
-                progress(line.strip()[:500])
-    if completed.returncode != 0:
-        raise RuntimeError(f"{Path(command[0]).name} failed ({completed.returncode}): {output[-1800:]}")
+    process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=merged)
+    _set_active_process(process)
+    lines: list[str] = []
+
+    def relay() -> None:
+        if process.stdout is None:
+            return
+        for raw in process.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            lines.append(line)
+            if progress:
+                progress(line[:500])
+
+    reader = threading.Thread(target=relay, name=f"aismith-{Path(command[0]).stem}-log", daemon=True)
+    reader.start()
+    try:
+        return_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait(timeout=15)
+        raise RuntimeError(f"{Path(command[0]).name} exceeded its {timeout // 60}-minute time limit") from exc
+    finally:
+        reader.join(timeout=5)
+        _set_active_process(None)
+    output = "\n".join(lines).strip()
+    if return_code != 0:
+        raise RuntimeError(f"{Path(command[0]).name} failed ({return_code}): {output[-1800:]}")
     return output
 
 
@@ -261,7 +300,7 @@ def blender_bake_retopology(source_glb: Path, remeshed_obj: Path, output_glb: Pa
     run_process([str(blender), "--background", "--factory-startup", "--python", str(worker), "--", spec], progress=progress, timeout=1800)
 
 
-def run_trellis(input_image: Path, output_glb: Path, resolution: int, progress: Progress | None = None) -> dict[str, Any]:
+def run_trellis(input_image: Path, output_glb: Path, resolution: int, seed: int = 0, progress: Progress | None = None) -> dict[str, Any]:
     cli = trellis_cli()
     if cli is None:
         raise RuntimeError("trellis.cpp CUDA runtime is not installed. Click Download models to install its Windows CUDA release.")
@@ -277,10 +316,12 @@ def run_trellis(input_image: Path, output_glb: Path, resolution: int, progress: 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
         port = int(probe.getsockname()[1])
-    command = [str(cli), "--models", str(trellis_model_dir()), "--res", str(resolution), "--require-gpu", "--seed", "0", "--host", "127.0.0.1", "--port", str(port)]
+    actual_resolution = 512 if resolution <= 512 else 1024
+    command = [str(cli), "--models", str(trellis_model_dir()), "--res", str(actual_resolution), "--no-texture", "--require-gpu", "--seed", str(seed), "--host", "127.0.0.1", "--port", str(port)]
     if progress:
         progress("Starting private native trellis.cpp worker")
     server = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    _set_active_process(server)
     server_output = ""
     log_lines: list[str] = []
 
@@ -308,6 +349,7 @@ def run_trellis(input_image: Path, output_glb: Path, resolution: int, progress: 
                 server.kill()
                 server.wait(timeout=15)
         log_thread.join(timeout=3)
+        _set_active_process(None)
         server_output = "\n".join(log_lines)
         return server_output
 
@@ -333,7 +375,7 @@ def run_trellis(input_image: Path, output_glb: Path, resolution: int, progress: 
         response = requests.post(
             f"http://127.0.0.1:{port}/generate",
             files={"image": ("reference.png", prepared_png, "image/png")},
-            data={"seed": "0", "resolution": str(resolution)},
+            data={"seed": str(seed), "resolution": str(actual_resolution)},
             timeout=7200,
         )
         if not response.ok:
@@ -342,7 +384,7 @@ def run_trellis(input_image: Path, output_glb: Path, resolution: int, progress: 
         output_glb.write_bytes(response.content)
     finally:
         stop_server()
-    return {"backend": "trellis.cpp", "model_set": "ilintar/trellis2-gguf", "resolution": resolution}
+    return {"backend": "trellis.cpp", "model_set": "ilintar/trellis2-gguf geometry", "resolution": actual_resolution, "seed": seed, "textured": False}
 
 
 def run_trellis_gguf(input_image: Path, output_glb: Path, resolution: int, progress: Progress | None = None) -> dict[str, Any]:
@@ -626,51 +668,86 @@ def run_instant_meshes(input_glb: Path, output_glb: Path, target_vertices: int, 
     }
 
 
-def run_trellis_ai_refine(input_glb: Path, source_image: Path, output_glb: Path, target_vertices: int, progress: Progress | None = None) -> dict[str, Any]:
-    """Image-guided geometry restoration followed by the existing quad export.
-
-    The FP8 TRELLIS.2 worker repairs/recreates image-supported geometry before
-    Instant Meshes sees it.  That avoids applying an unreliable hole filler to
-    a damaged quad mesh, while retaining the existing Blender texture transfer.
-    """
+def run_trellis_ai_refine(input_glb: Path, source_image: Path, output_glb: Path, target_vertices: int, repair_holes: bool = False, gpu_first: bool = False, progress: Progress | None = None) -> dict[str, Any]:
+    """Image-guided FP8 refinement, CuMesh reconstruction, and PBR texturing."""
     if not trellis_refiner_ready():
-        raise RuntimeError("AI Refine is not downloaded. Open Retopologize and download the TRELLIS.2 FP8 refiner first.")
-    exe = instant_meshes_exe()
-    if exe is None:
-        raise RuntimeError("Instant Meshes is required after AI Refine. Download it from Retopologize first.")
-    if find_blender() is None:
-        raise RuntimeError("Blender 4.2+ is required for texture baking")
-    temp_dir = output_glb.parent / f"trellis-refine-{output_glb.stem}"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    refined_obj = temp_dir / "refined.obj"
-    remeshed_obj = temp_dir / "remeshed.obj"
-    try:
-        worker = ROOT / "backend" / "workers" / "trellis_refiner_worker.py"
+        raise RuntimeError("TRELLIS.2 FP8 is not downloaded. Download the generation model first.")
+    worker = ROOT / "backend" / "workers" / "trellis2_fp8_worker.py"
+    def run_worker(use_gpu_first: bool, safe_reconstruction: bool = False) -> None:
         spec = json.dumps({
-            "runtime": str(trellis_refiner_dir()), "input_glb": str(input_glb),
-            "source_image": str(source_image), "output_obj": str(refined_obj),
+            "operation": "refine", "runtime": str(trellis_refiner_dir()),
+            "input_glb": str(input_glb), "source_image": str(source_image),
+            "output_glb": str(output_glb), "resolution": 1024,
+            "target_faces": target_vertices, "repair_holes": repair_holes, "gpu_first": use_gpu_first,
+            "safe_reconstruction": safe_reconstruction,
         })
         run_process([sys.executable, str(worker), spec], progress=progress, timeout=7200)
-        if progress:
-            progress("Instant Meshes: extracting the requested quad topology")
-        run_process([
-            str(exe), "--output", str(remeshed_obj), "--vertices", str(target_vertices),
-            "--boundaries", "--dominant", "--smooth", "0", str(refined_obj),
-        ], progress=progress, timeout=3600)
-        if not remeshed_obj.is_file() or remeshed_obj.stat().st_size < 64:
-            raise RuntimeError("Instant Meshes completed without writing the refined retopology")
-        if progress:
-            progress("Baking original GLB textures onto the AI-refined quad mesh")
-        blender_bake_retopology(input_glb, remeshed_obj, output_glb, progress)
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    used_gpu_first = gpu_first
+    used_safe_reconstruction = False
+    try:
+        run_worker(gpu_first)
+    except RuntimeError as exc:
+        quad_crashed = "3221225477" in str(exc) or "QEF" in str(exc)
+        if not gpu_first and not quad_crashed:
+            raise
+        if quad_crashed and not gpu_first:
+            if progress:
+                progress("Quad reconstruction could not complete; retrying compatible reconstruction")
+            used_safe_reconstruction = True
+            run_worker(False, safe_reconstruction=True)
+            return {
+                "backend": "trellis2-fp8-refine-reconstruct-texture",
+                "source_image_guided": True,
+                "model": "visualbruno/TRELLIS.2-4B-FP8",
+                "target_vertices": target_vertices,
+                "resolution": 1024,
+                "gpu_first_requested": gpu_first,
+                "gpu_first_used": False,
+                "reconstruction": "compatible",
+                "texture_transfer": "trellis2-image-conditioned-pbr",
+            }
+        # A full-resident FP8 pipeline can overflow or crash native CUDA
+        # extensions on 8-GB cards. Retry the same job with staged offloading
+        # so an experimental speed option never loses the user's work.
+        if gpu_first and progress:
+            progress("GPU-first could not complete; retrying in standard mode")
+        used_gpu_first = False
+        try:
+            run_worker(False)
+        except RuntimeError as retry_exc:
+            if not (quad_crashed or "3221225477" in str(retry_exc) or "QEF" in str(retry_exc)):
+                raise
+            if progress:
+                progress("Quad reconstruction could not complete; retrying compatible reconstruction")
+            used_safe_reconstruction = True
+            run_worker(False, safe_reconstruction=True)
     return {
-        "backend": "trellis2-fp8-ai-refine+instant-meshes",
+        "backend": "trellis2-fp8-refine-reconstruct-texture",
         "source_image_guided": True,
         "model": "visualbruno/TRELLIS.2-4B-FP8",
         "target_vertices": target_vertices,
-        "texture_transfer": "blender-selected-to-active-bake",
+        "resolution": 1024,
+        "gpu_first_requested": gpu_first,
+        "gpu_first_used": used_gpu_first,
+        "reconstruction": "compatible" if used_safe_reconstruction else "quad",
+        "texture_transfer": "trellis2-image-conditioned-pbr",
     }
+
+
+def run_trellis_fp8(input_image: Path, output_glb: Path, resolution: int, progress: Progress | None = None) -> dict[str, Any]:
+    """Generate a PBR GLB through the same FP8 TRELLIS.2 runtime as refine."""
+    if not trellis_refiner_ready():
+        raise RuntimeError("TRELLIS.2 FP8 is not downloaded. Download the generation model first.")
+    worker = ROOT / "backend" / "workers" / "trellis2_fp8_worker.py"
+    actual_resolution = 512 if resolution <= 512 else 1024
+    spec = json.dumps({
+        "operation": "generate", "runtime": str(trellis_refiner_dir()),
+        "source_image": str(input_image), "output_glb": str(output_glb),
+        "resolution": actual_resolution,
+    })
+    run_process([sys.executable, str(worker), spec], progress=progress, timeout=7200)
+    return {"backend": "trellis2-fp8", "model": "visualbruno/TRELLIS.2-4B-FP8", "resolution": actual_resolution, "textured": True}
 
 
 def run_skintoken(input_glb: Path, output_glb: Path, progress: Progress | None = None) -> dict[str, Any]:

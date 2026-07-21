@@ -18,6 +18,7 @@ if (Test-Path .env) {
 }
 
 $venvPython = Join-Path $root '.venv/Scripts/python.exe'
+$apiState = Join-Path $root 'studio-data/api-process.json'
  $environmentReady = $false
 if (Test-Path $venvPython) {
   & $venvPython -c "import fastapi, uvicorn, torch" 2>$null
@@ -28,6 +29,19 @@ if (-not $environmentReady -or $Install) {
   & (Join-Path $root 'scripts/setup.ps1')
 }
 if (-not (Test-Path $venvPython)) { throw 'AISmith 3D dedicated environment was not created.' }
+
+# Replacing a prior launcher-owned API is safe even when it no longer owns the
+# port. This prevents invisible stale workers from accumulating between runs.
+if (Test-Path $apiState) {
+  try {
+    $savedApi = Get-Content $apiState -Raw | ConvertFrom-Json
+    $savedProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $($savedApi.pid)" -ErrorAction SilentlyContinue
+    if ($savedProcess -and $savedProcess.ExecutablePath -eq $venvPython -and $savedProcess.CommandLine -match 'backend\.app\.main:app') {
+      Stop-Process -Id $savedApi.pid -Force
+    }
+  } catch {}
+  Remove-Item -LiteralPath $apiState -Force -ErrorAction SilentlyContinue
+}
 
 $apiListener = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($apiListener) {
@@ -43,6 +57,7 @@ if ($apiListener) {
 }
 
 Write-Host 'Starting AISmith 3D API on http://127.0.0.1:8000 ...' -ForegroundColor Cyan
-Start-Process -WindowStyle Hidden -FilePath $venvPython -ArgumentList '-m','uvicorn','backend.app.main:app','--host','127.0.0.1','--port','8000' -WorkingDirectory $root
+$api = Start-Process -WindowStyle Hidden -PassThru -FilePath $venvPython -ArgumentList '-m','uvicorn','backend.app.main:app','--host','127.0.0.1','--port','8000' -WorkingDirectory $root
+@{ pid = $api.Id } | ConvertTo-Json | Set-Content -LiteralPath $apiState -Encoding utf8
 Write-Host 'Starting AISmith 3D UI on http://127.0.0.1:5173 ...' -ForegroundColor Cyan
 npm.cmd --prefix frontend run dev -- --host 127.0.0.1
