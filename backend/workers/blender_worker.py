@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import bpy
+from mathutils import Vector
 
 
 def log(message: str) -> None:
@@ -63,6 +64,163 @@ def export_glb(path: str, *, animations: bool = True) -> None:
 def convert(input_path: str, output_path: str) -> None:
     clear_scene()
     import_model(input_path)
+    export_glb(output_path, animations=False)
+
+
+def export_obj(input_path: str, output_path: str) -> None:
+    """Export source geometry unchanged at the GLB/OBJ boundary."""
+    clear_scene()
+    import_model(input_path)
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.wm.obj_export(
+        filepath=output_path,
+        export_materials=False,
+        export_normals=True,
+        export_uv=True,
+        export_triangulated_mesh=True,
+    )
+
+
+def _join_meshes(meshes):
+    meshes = [obj for obj in meshes if obj.type == "MESH"]
+    if not meshes:
+        raise RuntimeError("No mesh was imported")
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in meshes:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = meshes[0]
+    if len(meshes) > 1:
+        bpy.ops.object.join()
+    return bpy.context.view_layer.objects.active
+
+
+def _ensure_uv(obj) -> None:
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.uv.smart_project(island_margin=0.015)
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def _mesh_ray_distance(meshes) -> float:
+    points = [obj.matrix_world @ Vector(corner) for obj in meshes if obj.type == "MESH" for corner in obj.bound_box]
+    if not points:
+        return 0.01
+    lo = [min(point[i] for point in points) for i in range(3)]
+    hi = [max(point[i] for point in points) for i in range(3)]
+    diagonal = math.sqrt(sum((hi[i] - lo[i]) ** 2 for i in range(3)))
+    return max(0.001, diagonal * 0.025)
+
+
+def _select_for_bake(source_meshes, target) -> None:
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in source_meshes:
+        obj.select_set(True)
+    target.select_set(True)
+    bpy.context.view_layer.objects.active = target
+
+
+def _bake_emit_channel(source_meshes, target, image, input_name: str, distance: float) -> None:
+    """Bake a Principled input through emission without changing source files."""
+    saved = []
+    for obj in source_meshes:
+        for material in obj.data.materials:
+            if material is None:
+                continue
+            material.use_nodes = True
+            nodes, links = material.node_tree.nodes, material.node_tree.links
+            output = next((node for node in nodes if node.type == "OUTPUT_MATERIAL"), None)
+            principled = next((node for node in nodes if node.type == "BSDF_PRINCIPLED"), None)
+            source_input = principled.inputs.get(input_name) if principled else None
+            if output is None or source_input is None:
+                continue
+            original = [(link.from_socket, link.to_socket) for link in list(output.inputs["Surface"].links)]
+            for link in list(output.inputs["Surface"].links):
+                links.remove(link)
+            emission = nodes.new("ShaderNodeEmission")
+            emission.name = "AISmith temporary bake emission"
+            if source_input.is_linked:
+                links.new(source_input.links[0].from_socket, emission.inputs["Color"])
+            else:
+                value = source_input.default_value
+                if isinstance(value, float):
+                    emission.inputs["Color"].default_value = (value, value, value, 1.0)
+                else:
+                    emission.inputs["Color"].default_value = value
+            links.new(emission.outputs[0], output.inputs["Surface"])
+            saved.append((nodes, links, output, original, emission))
+    try:
+        _select_for_bake(source_meshes, target)
+        bpy.ops.object.bake(type="EMIT", use_selected_to_active=True, cage_extrusion=distance, max_ray_distance=distance, margin=12)
+    finally:
+        for nodes, links, output, original, emission in saved:
+            for link in list(output.inputs["Surface"].links):
+                links.remove(link)
+            for from_socket, to_socket in original:
+                links.new(from_socket, to_socket)
+            nodes.remove(emission)
+
+
+def _activate_image(material, image):
+    material.use_nodes = True
+    node = material.node_tree.nodes.new("ShaderNodeTexImage")
+    node.image = image
+    for item in material.node_tree.nodes:
+        item.select = False
+    node.select = True
+    material.node_tree.nodes.active = node
+    return node
+
+
+def retopo_bake(source_path: str, target_path: str, output_path: str) -> None:
+    """Bake source PBR appearance to a newly unwrapped Instant Meshes mesh."""
+    clear_scene()
+    import_model(source_path)
+    source_meshes = list(selected_meshes())
+    if not source_meshes:
+        raise RuntimeError("The source GLB has no mesh to bake")
+    import_model(target_path)
+    target_meshes = [obj for obj in selected_meshes() if obj not in source_meshes]
+    target = _join_meshes(target_meshes)
+    target.name = "AISmith_Retopologized"
+    _ensure_uv(target)
+
+    target.data.materials.clear()
+    material = bpy.data.materials.new("AISmith Retopologized Material")
+    material.use_nodes = True
+    target.data.materials.append(material)
+    size = 2048
+    base = bpy.data.images.new("AISmith_Retopo_BaseColor", width=size, height=size, alpha=True)
+    roughness = bpy.data.images.new("AISmith_Retopo_Roughness", width=size, height=size, alpha=False)
+    metallic = bpy.data.images.new("AISmith_Retopo_Metallic", width=size, height=size, alpha=False)
+    for image in (roughness, metallic):
+        image.colorspace_settings.name = "Non-Color"
+    distance = _mesh_ray_distance(source_meshes)
+    bpy.context.scene.render.engine = "CYCLES"
+    bpy.context.scene.cycles.samples = 16
+    bpy.context.scene.render.bake.margin = 12
+
+    for image, channel in ((base, "Base Color"), (roughness, "Roughness"), (metallic, "Metallic")):
+        _activate_image(material, image)
+        log(f"Baking {channel} texture")
+        _bake_emit_channel(source_meshes, target, image, channel, distance)
+        image.pack()
+
+    nodes, links = material.node_tree.nodes, material.node_tree.links
+    bsdf = next(node for node in nodes if node.type == "BSDF_PRINCIPLED")
+    textures = [node for node in nodes if node.type == "TEX_IMAGE"]
+    base_node, rough_node, metallic_node = textures[-3:]
+    links.new(base_node.outputs["Color"], bsdf.inputs["Base Color"])
+    links.new(rough_node.outputs["Color"], bsdf.inputs["Roughness"])
+    links.new(metallic_node.outputs["Color"], bsdf.inputs["Metallic"])
+    for obj in source_meshes:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    bpy.ops.object.select_all(action="DESELECT")
+    target.select_set(True)
+    bpy.context.view_layer.objects.active = target
     export_glb(output_path, animations=False)
 
 
@@ -230,6 +388,10 @@ def main() -> None:
     op = spec["op"]
     if op == "convert":
         convert(spec["input"], spec["output"])
+    elif op == "export-obj":
+        export_obj(spec["input"], spec["output"])
+    elif op == "retopo-bake":
+        retopo_bake(spec["source"], spec["target"], spec["output"])
     elif op == "paint":
         paint(spec["input"], spec["output"], spec.get("settings", {}))
     elif op == "animate":
@@ -240,4 +402,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

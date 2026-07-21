@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 import uuid
+import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -44,6 +46,7 @@ class JobRequest(BaseModel):
     # cascade, then creates a viewport-friendly PBR asset.
     resolution: Literal[512, 768, 1024] = 768
     target_faces: int = Field(default=10000, ge=500, le=200000)
+    target_vertices: int | None = Field(default=None, ge=500, le=1_000_000)
     quality: Literal["game", "balanced", "high"] = "game"
     animation: str = "Idle"
     settings: dict[str, Any] = Field(default_factory=dict)
@@ -234,6 +237,8 @@ def _model_readiness() -> dict[str, bool]:
         "trellis_cpp_ready": native.trellis_workflow_ready(),
         "trellis_gguf_ready": native.trellis_workflow_ready(),
         "skintoken_ready": (skintoken_root / "experiments/skin_vae_2_10_32768/last.ckpt").exists() and (skintoken_root / "experiments/articulation_xl_quantization_256_token_4/grpo_1400.ckpt").exists(),
+        "instant_meshes_ready": native.instant_meshes_exe() is not None,
+        "trellis_refiner_ready": native.trellis_refiner_ready(),
     }
 
 
@@ -247,6 +252,12 @@ def _download_log(state: DownloadState, message: str, progress: int | None = Non
 
 
 def _run_model_download(state: DownloadState) -> None:
+    if state.model == "instant-meshes":
+        _run_instant_meshes_download(state)
+        return
+    if state.model == "trellis-refiner":
+        _run_trellis_refiner_download(state)
+        return
     command = [sys.executable, "-u", "-m", "backend.bootstrap", "--download-model", state.model]
     state.status = "running"
     _download_log(state, f"Preparing {state.model} download", 3)
@@ -287,6 +298,128 @@ def _run_model_download(state: DownloadState) -> None:
         _download_log(state, f"Download failed: {exc}", state.progress)
 
 
+def _run_instant_meshes_download(state: DownloadState) -> None:
+    """Fetch the upstream Windows bundle and safely unpack it into app data."""
+    url = "https://instant-meshes.s3.eu-central-1.amazonaws.com/Release/instant-meshes-windows.zip"
+    archive = DOWNLOADS_DIR / f"{state.id}-instant-meshes.zip"
+    install = native.instant_meshes_dir()
+    state.status = "running"
+    _download_log(state, "Downloading Instant Meshes for Windows", 3)
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "AISmith-3D/1.0"})
+        with urllib.request.urlopen(request, timeout=60) as response, archive.open("wb") as handle:
+            total = int(response.headers.get("Content-Length") or 0)
+            state.file_name = "instant-meshes-windows.zip"
+            state.file_index = state.file_count = 1
+            state.file_total_bytes = total
+            while chunk := response.read(1024 * 1024):
+                handle.write(chunk)
+                state.file_bytes += len(chunk)
+                fraction = state.file_bytes / total if total else 0
+                _download_log(state, "Downloading Instant Meshes for Windows", min(88, max(4, round(fraction * 88))))
+        _download_log(state, "Extracting Instant Meshes executable", 90)
+        install.mkdir(parents=True, exist_ok=True)
+        destination_root = install.resolve()
+        with zipfile.ZipFile(archive) as bundle:
+            for member in bundle.infolist():
+                destination = (destination_root / member.filename).resolve()
+                if destination != destination_root and destination_root not in destination.parents:
+                    raise RuntimeError("Instant Meshes archive contains an unsafe file path")
+                if member.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.open(member) as source, destination.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+        if native.instant_meshes_exe() is None:
+            raise RuntimeError("The download completed but Instant Meshes.exe was not found in the archive")
+        state.status = "completed"
+        _download_log(state, "Instant Meshes is ready", 100)
+    except Exception as exc:
+        state.status = "failed"
+        state.error = str(exc)
+        _download_log(state, f"Download failed: {exc}", state.progress)
+    finally:
+        archive.unlink(missing_ok=True)
+
+
+def _run_trellis_refiner_download(state: DownloadState) -> None:
+    """Install the isolated ComfyUI runtime and FP8 refiner checkpoints.
+
+    It deliberately uses the app's CUDA Python environment rather than the
+    generation C++ runtime.  The two stacks must never share a process.
+    """
+    runtime = native.trellis_refiner_dir()
+    archive = DOWNLOADS_DIR / f"{state.id}-comfyui.zip"
+    comfy = runtime / "ComfyUI"
+    wrapper_source = ROOT / "vendor" / "ComfyUI-Trellis2"
+    state.status = "running"
+    _download_log(state, "Preparing isolated TRELLIS.2 FP8 runtime", 2)
+    try:
+        if not wrapper_source.is_dir():
+            raise RuntimeError("The bundled ComfyUI-Trellis2 integration is missing")
+        if not (comfy / "folder_paths.py").exists():
+            _download_log(state, "Downloading the local CUDA refiner runtime", 5)
+            request = urllib.request.Request("https://github.com/comfyanonymous/ComfyUI/archive/refs/heads/master.zip", headers={"User-Agent": "AISmith-3D/1.0"})
+            with urllib.request.urlopen(request, timeout=120) as response, archive.open("wb") as handle:
+                total = int(response.headers.get("Content-Length") or 0)
+                state.file_name, state.file_index, state.file_count, state.file_total_bytes = "ComfyUI runtime", 1, 5, total
+                while chunk := response.read(1024 * 1024):
+                    handle.write(chunk)
+                    state.file_bytes += len(chunk)
+                    fraction = state.file_bytes / total if total else 0
+                    _download_log(state, "Downloading the local CUDA refiner runtime", min(20, 5 + round(fraction * 15)))
+            extracted = runtime / "ComfyUI-master"
+            with zipfile.ZipFile(archive) as bundle:
+                for member in bundle.infolist():
+                    destination = (runtime / member.filename).resolve()
+                    if runtime.resolve() not in destination.parents and destination != runtime.resolve():
+                        raise RuntimeError("ComfyUI archive contains an unsafe file path")
+                    bundle.extract(member, runtime)
+            if not extracted.exists():
+                raise RuntimeError("ComfyUI runtime archive was incomplete")
+            extracted.rename(comfy)
+        _download_log(state, "Installing the TRELLIS.2 refiner CUDA extensions", 25)
+        target = comfy / "custom_nodes" / "ComfyUI-Trellis2"
+        if not target.exists():
+            shutil.copytree(wrapper_source, target)
+        wheel_root = wrapper_source / "wheels" / "Windows" / "Torch280"
+        wheels = [
+            wheel_root / "cumesh-1.0-cp312-cp312-win_amd64.whl",
+            wheel_root / "nvdiffrast-0.4.0-cp312-cp312-win_amd64.whl",
+            wheel_root / "nvdiffrec_render-0.0.0-cp312-cp312-win_amd64.whl",
+            wheel_root / "flex_gemm-0.0.1-cp312-cp312-win_amd64.whl",
+            wheel_root / "o_voxel-0.0.1-cp312-cp312-win_amd64.whl",
+        ]
+        if not all(wheel.exists() for wheel in wheels):
+            raise RuntimeError("No CUDA extension wheels match the app's Python 3.12 / Torch 2.8 runtime")
+        command = [sys.executable, "-m", "pip", "install", "--upgrade-strategy", "only-if-needed", "-r", str(comfy / "requirements.txt"), "huggingface_hub", *map(str, wheels)]
+        completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=1800)
+        if completed.returncode != 0:
+            raise RuntimeError(f"Could not install TRELLIS.2 refiner dependencies: {(completed.stdout + completed.stderr)[-1200:]}")
+        _download_log(state, "Downloading FP8 TRELLIS.2 refinement models", 35)
+        from huggingface_hub import snapshot_download
+        models = runtime / "models"
+        for index, repo in enumerate((
+            "visualbruno/TRELLIS.2-4B-FP8",
+            "facebook/dinov3-vitl16-pretrain-lvd1689m",
+            "microsoft/TRELLIS-image-large",
+        ), start=1):
+            state.file_name, state.file_index, state.file_count = repo, index, 3
+            _download_log(state, f"Downloading {repo}", 35 + index * 15)
+            snapshot_download(repo_id=repo, local_dir=models / repo, local_dir_use_symlinks=False)
+        if not native.trellis_refiner_ready():
+            raise RuntimeError("The TRELLIS.2 refiner download did not contain all required model files")
+        state.status = "completed"
+        _download_log(state, "AI Refine is ready", 100)
+    except Exception as exc:
+        state.status = "failed"
+        state.error = str(exc)
+        _download_log(state, f"Download failed: {exc}", state.progress)
+    finally:
+        archive.unlink(missing_ok=True)
+
+
 async def _execute_download(state: DownloadState) -> None:
     await asyncio.to_thread(_run_model_download, state)
 
@@ -325,6 +458,13 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
 
         output = ARTIFACTS / f"job-{job.id}.glb"
         metadata = {"stage": request.kind, "settings": request.settings, "native": True, "worker_isolated": True}
+        # Keep provenance with every generated asset.  The optional image-guided
+        # TRELLIS refiner needs the exact original reference image; it must not
+        # guess one from the texture baked into a GLB.
+        if source is not None:
+            metadata["source_artifact_id"] = source.id
+        if request.kind == "generate" and source is not None:
+            metadata["source_image_artifact_id"] = source.id
         if request.kind == "generate":
             if source is None or source.kind not in {"image", "png", "jpg", "jpeg", "webp"}:
                 raise ValueError("Generate requires a single uploaded image")
@@ -335,7 +475,28 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
         elif source:
             _job_log(job, f"Loading {source.name} into the {request.kind} worker", 15)
             if request.kind == "retopologize":
-                metadata.update(await asyncio.to_thread(native.run_autoremesher, Path(source.path), output, request.target_faces, request.quality, lambda message: _job_log(job, message, min(78, max(18, job.progress + 3)))))
+                target_vertices = request.target_vertices or request.target_faces
+                repair_holes = bool(request.settings.get("repair_holes", False))
+                method = str(request.settings.get("retopo_method", "instant-meshes"))
+                if method == "ai-refine":
+                    # An explicitly attached image is required for imported GLBs
+                    # and intentionally takes precedence over inherited Generate
+                    # provenance for a user who wants to refine against another view.
+                    image_id = str(request.settings.get("refine_image_artifact_id") or source.metadata.get("source_image_artifact_id") or "")
+                    if not image_id:
+                        parent_id = str(source.metadata.get("source_artifact_id") or "")
+                        if parent_id:
+                            parent = read_artifact(parent_id)
+                            image_id = str(parent.metadata.get("source_image_artifact_id") or (parent.id if parent.kind == "image" else ""))
+                    if not image_id:
+                        raise ValueError("AI Refine requires a GLB generated from this app so its original reference image is available.")
+                    image = read_artifact(image_id)
+                    if image.kind != "image":
+                        raise ValueError("The retained AI Refine reference is not an image artifact.")
+                    metadata["source_image_artifact_id"] = image.id
+                    metadata.update(await asyncio.to_thread(native.run_trellis_ai_refine, Path(source.path), Path(image.path), output, target_vertices, lambda message: _job_log(job, message, min(94, max(18, job.progress + 4)))))
+                else:
+                    metadata.update(await asyncio.to_thread(native.run_instant_meshes, Path(source.path), output, target_vertices, repair_holes, lambda message: _job_log(job, message, min(94, max(18, job.progress + 4)))))
             elif request.kind == "rig":
                 metadata.update(await asyncio.to_thread(native.run_skintoken, Path(source.path), output, lambda message: _job_log(job, message, min(78, max(18, job.progress + 3)))))
             elif request.kind == "animate":
@@ -372,7 +533,7 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
 async def capabilities() -> dict[str, Any]:
     gpu = _gpu_info()
     blender_path = native.find_blender()
-    remesher = native.autoremesher_exe()
+    instant_meshes = native.instant_meshes_exe()
     skintoken_repo = native.skintoken_repo()
     readiness = _model_readiness()
     diagnostics: list[str] = []
@@ -384,8 +545,8 @@ async def capabilities() -> dict[str, Any]:
                 diagnostics.append("SkinToken requires Ampere-or-newer compute capability (8.0+).")
         except ValueError:
             pass
-    if remesher is None:
-        diagnostics.append("AutoRemesher executable is not configured; build vendor/autoremesher and set AUTOREMESHER_EXE.")
+    if instant_meshes is None:
+        diagnostics.append("Instant Meshes is not installed. Open Retopologize and download its Windows bundle.")
     if blender_path is None:
         diagnostics.append("Blender 4.2+ was not found; GLB conversion, texture baking, rigging, and animation export are unavailable.")
     return {
@@ -399,7 +560,8 @@ async def capabilities() -> dict[str, Any]:
             "trellis_cpp_ready": readiness["trellis_cpp_ready"],
             "trellis_gguf_ready": readiness["trellis_gguf_ready"],
             "trellis2_native": readiness["trellis_gguf_ready"],
-            "autoremesher_native": remesher is not None,
+            "instant_meshes_native": instant_meshes is not None,
+            "trellis_refiner_ready": readiness["trellis_refiner_ready"],
             "skintoken_native": (skintoken_repo / "nodes.py").exists(),
             "skintoken_ready": readiness["skintoken_ready"],
             "mesh2motion_native": native.mesh2motion_library().exists(),
@@ -439,6 +601,10 @@ async def create_job(request: JobRequest, background_tasks: BackgroundTasks) -> 
             raise HTTPException(status_code=409, detail="The Trellis2 geometry and texture workflow is not downloaded. Open the Generate tab and download it before starting inference.")
     if request.kind == "rig" and not readiness["skintoken_ready"]:
         raise HTTPException(status_code=409, detail="SkinToken checkpoints are not downloaded. Open the Auto Rig tab and download them before starting rigging.")
+    if request.kind == "retopologize" and not readiness["instant_meshes_ready"]:
+        raise HTTPException(status_code=409, detail="Instant Meshes is not downloaded. Open Retopologize and download the engine before starting.")
+    if request.kind == "retopologize" and request.settings.get("retopo_method") == "ai-refine" and not readiness["trellis_refiner_ready"]:
+        raise HTTPException(status_code=409, detail="AI Refine is not downloaded. Open Retopologize and download the TRELLIS.2 FP8 refiner before starting.")
     if request.kind != "generate" and not request.source_artifact_id:
         raise HTTPException(status_code=400, detail=f"{request.kind} requires source_artifact_id")
     job = JobState(id=uuid.uuid4().hex, kind=request.kind)
@@ -455,7 +621,7 @@ async def list_downloads() -> list[dict[str, Any]]:
 
 @app.post("/api/models/{name}/download", response_model=DownloadState)
 async def download_model(name: str, background_tasks: BackgroundTasks) -> DownloadState:
-    if name not in {"trellis2", "skintoken"}:
+    if name not in {"trellis2", "skintoken", "instant-meshes", "trellis-refiner"}:
         raise HTTPException(status_code=404, detail="This tab has no downloadable model package")
     gpu = _gpu_info()
     if name == "skintoken" and not gpu["native_inference_ready"]:
@@ -463,8 +629,12 @@ async def download_model(name: str, background_tasks: BackgroundTasks) -> Downlo
     readiness = _model_readiness()
     if name == "trellis2":
         ready = readiness["trellis_cpp_ready"]
-    else:
+    elif name == "skintoken":
         ready = readiness["skintoken_ready"]
+    elif name == "trellis-refiner":
+        ready = readiness["trellis_refiner_ready"]
+    else:
+        ready = readiness["instant_meshes_ready"]
     if ready:
         state = DownloadState(id=uuid.uuid4().hex, model=name, status="completed", progress=100, message="Already downloaded")
         return state
@@ -542,6 +712,35 @@ async def download_artifact(artifact_id: str) -> FileResponse:
     artifact = read_artifact(artifact_id)
     path = _artifact_path(artifact_id)
     return FileResponse(path, filename=artifact.name if Path(artifact.name).suffix else f"{artifact.name}.glb", media_type="model/gltf-binary")
+
+
+@app.get("/api/assets/{artifact_id}/details")
+async def asset_details(artifact_id: str) -> dict[str, Any]:
+    """Read actual mesh counts from generated and uploaded GLB artifacts."""
+    artifact = read_artifact(artifact_id)
+    path = _artifact_path(artifact_id)
+    if path.suffix.lower() not in {".glb", ".gltf"}:
+        raise HTTPException(status_code=415, detail="Model details are available for GLB and glTF assets")
+    try:
+        import trimesh
+
+        scene = trimesh.load(path, force="scene", process=False)
+        geometries = list(scene.geometry.values())
+        materials = {
+            id(getattr(getattr(mesh, "visual", None), "material", None))
+            for mesh in geometries
+            if getattr(getattr(mesh, "visual", None), "material", None) is not None
+        }
+        return {
+            "vertices": sum(len(mesh.vertices) for mesh in geometries),
+            "triangles": sum(len(mesh.faces) for mesh in geometries),
+            "materials": len(materials),
+            "meshes": len(geometries),
+            "format": path.suffix.lstrip(".").upper(),
+            "size_bytes": path.stat().st_size,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Could not inspect this model: {exc}") from exc
 
 
 @app.post("/api/assets/{artifact_id}/open-location")

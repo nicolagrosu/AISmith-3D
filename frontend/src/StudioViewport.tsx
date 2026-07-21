@@ -7,7 +7,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import type { ModelViewerElement } from '@google/model-viewer'
 
 type ViewMode = 'scene' | 'solid' | 'wireframe'
-type Props = { artifactId?: string; artifactKind?: string; artifactName?: string; onImportModel?: () => void }
+type Props = { artifactId?: string; artifactKind?: string; artifactName?: string; onImportModel?: () => void; onModelLoaded?: () => void }
 const API = 'http://127.0.0.1:8000/api'
 
 function WireframePreview({ src, onReady, onError }: { src: string; onReady: () => void; onError: () => void }) {
@@ -93,7 +93,7 @@ function WireframePreview({ src, onReady, onError }: { src: string; onReady: () 
   return <div className="wireframe-preview" ref={host} />
 }
 
-export default function StudioViewport({ artifactId, artifactKind, artifactName, onImportModel }: Props) {
+export default function StudioViewport({ artifactId, artifactKind, artifactName, onImportModel, onModelLoaded }: Props) {
   const viewerRef = useRef<ModelViewerElement>(null)
   const [status, setStatus] = useState<'empty' | 'reference' | 'loading' | 'ready' | 'error'>(artifactKind === 'image' ? 'reference' : artifactId ? 'loading' : 'empty')
   const [mode, setMode] = useState<ViewMode>('scene')
@@ -119,12 +119,13 @@ export default function StudioViewport({ artifactId, artifactKind, artifactName,
         })
       }
       setStatus('ready')
+      onModelLoaded?.()
     }
     const failed = () => setStatus('error')
     viewer.addEventListener('load', ready)
     viewer.addEventListener('error', failed)
     return () => { viewer.removeEventListener('load', ready); viewer.removeEventListener('error', failed) }
-  }, [artifactId, isModel, mode])
+  }, [artifactId, isModel, mode, onModelLoaded])
 
   const changeMode = (next: ViewMode) => {
     setStatus('loading')
@@ -157,7 +158,7 @@ export default function StudioViewport({ artifactId, artifactKind, artifactName,
       loading="eager"
       className="model-preview"
     />}
-    {isModel && artifactId && mode === 'wireframe' && <WireframePreview src={src} onReady={() => setStatus('ready')} onError={() => setStatus('error')} />}
+    {isModel && artifactId && mode === 'wireframe' && <WireframePreview src={src} onReady={() => { setStatus('ready'); onModelLoaded?.() }} onError={() => setStatus('error')} />}
 
     {isModel && <div className="viewer-toolbar" aria-label="Viewer controls">
       <button className={mode === 'scene' ? 'active' : ''} onClick={() => changeMode('scene')} title="Textured scene"><Layers3 size={15} /> Scene</button>

@@ -5,3 +5,4 @@ pillow>=10.0
 trimesh>=4.4
 numpy>=1.26
 requests>=2.32
+pymeshfix>=0.17

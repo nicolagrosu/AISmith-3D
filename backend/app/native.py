@@ -185,6 +185,38 @@ def autoremesher_exe() -> Path | None:
     return next((path.resolve() for path in candidates if path.exists()), None)
 
 
+def instant_meshes_dir() -> Path:
+    """Managed install location for the official Instant Meshes Windows ZIP."""
+    return configured_path("INSTANT_MESHES_DIR", ROOT / "studio-data" / "tools" / "instant-meshes")
+
+
+def instant_meshes_exe() -> Path | None:
+    configured = os.getenv("INSTANT_MESHES_EXE", "").strip()
+    candidates = [Path(configured)] if configured else []
+    install = instant_meshes_dir()
+    candidates += [install / "Instant Meshes.exe", install / "InstantMeshes.exe"]
+    if install.exists():
+        candidates += install.rglob("Instant Meshes.exe")
+        candidates += install.rglob("InstantMeshes.exe")
+    return next((path.resolve() for path in candidates if path.exists()), None)
+
+
+def trellis_refiner_dir() -> Path:
+    """Managed, isolated ComfyUI runtime for image-guided TRELLIS.2 FP8 refine."""
+    return configured_path("TRELLIS_REFINER_DIR", ROOT / "studio-data" / "tools" / "trellis2-refiner")
+
+
+def trellis_refiner_ready() -> bool:
+    runtime = trellis_refiner_dir()
+    return all(path.exists() for path in (
+        runtime / "ComfyUI" / "folder_paths.py",
+        runtime / "ComfyUI" / "custom_nodes" / "ComfyUI-Trellis2" / "nodes.py",
+        runtime / "models" / "visualbruno" / "TRELLIS.2-4B-FP8",
+        runtime / "models" / "facebook" / "dinov3-vitl16-pretrain-lvd1689m" / "model.safetensors",
+        runtime / "models" / "microsoft" / "TRELLIS-image-large" / "ckpts" / "ss_dec_conv3d_16l8_fp16.safetensors",
+    ))
+
+
 def run_process(command: list[str], *, cwd: Path = ROOT, timeout: int = 3600, progress: Progress | None = None, env: dict[str, str] | None = None) -> str:
     if progress:
         progress(f"Launching {Path(command[0]).name}")
@@ -209,6 +241,24 @@ def blender_convert(input_path: Path, output_path: Path, progress: Progress | No
     worker = ROOT / "backend" / "workers" / "blender_worker.py"
     spec = json.dumps({"op": "convert", "input": str(input_path), "output": str(output_path)})
     run_process([str(blender), "--background", "--factory-startup", "--python", str(worker), "--", spec], progress=progress, timeout=600)
+
+
+def blender_export_obj(input_path: Path, output_path: Path, progress: Progress | None = None) -> None:
+    blender = find_blender()
+    if blender is None:
+        raise RuntimeError("Blender 4.2+ is required for GLB/OBJ conversion but was not found")
+    worker = ROOT / "backend" / "workers" / "blender_worker.py"
+    spec = json.dumps({"op": "export-obj", "input": str(input_path), "output": str(output_path)})
+    run_process([str(blender), "--background", "--factory-startup", "--python", str(worker), "--", spec], progress=progress, timeout=900)
+
+
+def blender_bake_retopology(source_glb: Path, remeshed_obj: Path, output_glb: Path, progress: Progress | None = None) -> None:
+    blender = find_blender()
+    if blender is None:
+        raise RuntimeError("Blender 4.2+ is required to bake source textures onto the retopologized mesh")
+    worker = ROOT / "backend" / "workers" / "blender_worker.py"
+    spec = json.dumps({"op": "retopo-bake", "source": str(source_glb), "target": str(remeshed_obj), "output": str(output_glb)})
+    run_process([str(blender), "--background", "--factory-startup", "--python", str(worker), "--", spec], progress=progress, timeout=1800)
 
 
 def run_trellis(input_image: Path, output_glb: Path, resolution: int, progress: Progress | None = None) -> dict[str, Any]:
@@ -479,27 +529,148 @@ def run_trellis_gguf(input_image: Path, output_glb: Path, resolution: int, progr
     }
 
 
-def run_autoremesher(input_glb: Path, output_glb: Path, target_faces: int, quality: str, progress: Progress | None = None) -> dict[str, Any]:
-    exe = autoremesher_exe()
+def repair_meshfix(input_obj: Path, output_obj: Path, progress: Progress | None = None) -> dict[str, int]:
+    """Repair an Instant Meshes output without modifying the original OBJ.
+
+    MeshFix operates on triangles, so this is intentionally an opt-in repair
+    stage for broken/non-manifold regions rather than part of normal retopo.
+    """
+    try:
+        import numpy as np
+        import pymeshfix
+        import trimesh
+    except ImportError as exc:
+        raise RuntimeError("MeshFix is not installed. Run start.ps1 -Install to add the optional repair dependency.") from exc
+    if progress:
+        progress("MeshFix: repairing holes and self-intersections")
+    source = trimesh.load(input_obj, force="mesh", process=False)
+    if not isinstance(source, trimesh.Trimesh) or source.faces.size == 0:
+        raise RuntimeError("MeshFix could not read a triangle mesh from Instant Meshes output")
+    before_vertices, before_faces = len(source.vertices), len(source.faces)
+    before_bounds = source.bounds.copy()
+    fixer = pymeshfix.MeshFix(np.asarray(source.vertices), np.asarray(source.faces), verbose=False)
+    # Preserve disconnected pieces such as accessories and do not bridge them.
+    fixer.repair(joincomp=False, remove_smallest_components=False)
+    repaired = trimesh.Trimesh(vertices=np.asarray(fixer.points), faces=np.asarray(fixer.faces), process=False)
+    if repaired.faces.size == 0 or not np.isfinite(repaired.vertices).all():
+        raise RuntimeError("MeshFix produced an invalid mesh")
+    if len(repaired.faces) > before_faces * 3 or len(repaired.vertices) > before_vertices * 3:
+        raise RuntimeError("MeshFix repair was rejected because it expanded the mesh too much")
+    source_diagonal = float(np.linalg.norm(before_bounds[1] - before_bounds[0]))
+    repaired_diagonal = float(np.linalg.norm(repaired.bounds[1] - repaired.bounds[0]))
+    if progress and source_diagonal > 0:
+        progress(f"MeshFix bounds: {source_diagonal:.4g} → {repaired_diagonal:.4g} ({repaired_diagonal / source_diagonal:.0%})")
+    # Repairing self-intersecting scraps can legitimately trim an extreme
+    # broken fragment. Guard against unexpected expansion, but permit a
+    # bounded shrink when the user explicitly opts into MeshFix.
+    if source_diagonal > 0 and (repaired_diagonal < source_diagonal * 0.5 or repaired_diagonal > source_diagonal * 1.25):
+        raise RuntimeError("MeshFix repair was rejected because it changed the model bounds by more than the safe limit")
+    output_obj.parent.mkdir(parents=True, exist_ok=True)
+    repaired.export(output_obj, file_type="obj")
+    return {
+        "input_vertices": before_vertices,
+        "input_faces": before_faces,
+        "output_vertices": len(repaired.vertices),
+        "output_faces": len(repaired.faces),
+    }
+
+
+def run_instant_meshes(input_glb: Path, output_glb: Path, target_vertices: int, repair_holes: bool = False, progress: Progress | None = None) -> dict[str, Any]:
+    """Retopologize a GLB via Instant Meshes' native batch mode.
+
+    The official executable exposes this exact non-interactive workflow:
+    extrinsic field (the default), boundary alignment, target vertex count,
+    orientation solve, position solve, and extraction. The GUI's default
+    extraction uses a quad-dominant mesh and zero smoothing passes.
+    """
+    exe = instant_meshes_exe()
     if exe is None:
-        raise RuntimeError("AutoRemesher executable was not found. Build vendor/autoremesher with Qt 5.15/MSVC, then set AUTOREMESHER_EXE.")
-    temp_dir = output_glb.parent / f"remesh-{output_glb.stem}"
+        raise RuntimeError("Instant Meshes is not installed. Open Retopologize and download the Instant Meshes engine first.")
+    if find_blender() is None:
+        raise RuntimeError("Blender 4.2+ is required for the GLB-to-OBJ conversion and texture bake")
+
+    temp_dir = output_glb.parent / f"instant-meshes-{output_glb.stem}"
     temp_dir.mkdir(parents=True, exist_ok=True)
     source_obj = temp_dir / "source.obj"
     result_obj = temp_dir / "remeshed.obj"
-    # Blender's GLB export is canonical; use its OBJ exporter for AutoRemesher's CLI boundary.
-    blender = find_blender()
-    worker = ROOT / "backend" / "workers" / "blender_obj_worker.py"
-    if not worker.exists():
-        raise RuntimeError("OBJ conversion worker is missing")
-    spec = json.dumps({"input": str(input_glb), "output": str(source_obj)})
-    run_process([str(blender), "--background", "--factory-startup", "--python", str(worker), "--", spec], progress=progress, timeout=600)
-    quality_values = {"game": (1.0, 70.0, 0.0, 1.0), "balanced": (1.0, 70.0, 0.0, 0.5), "high": (1.0, 90.0, 0.0, 0.2)}
-    edge, sharp, smooth, adapt = quality_values.get(quality, quality_values["game"])
-    run_process([str(exe), "--input", str(source_obj), "--output", str(result_obj), "--report", str(temp_dir / "report.txt"), "--target-quads", str(max(250, target_faces // 2)), "--edge-scaling", str(edge), "--sharp-edge", str(sharp), "--smooth-normal", str(smooth), "--adaptivity", str(adapt)], progress=progress, timeout=1800)
-    spec = json.dumps({"input": str(result_obj), "output": str(output_glb)})
-    run_process([str(blender), "--background", "--factory-startup", "--python", str(worker), "--", spec], progress=progress, timeout=600)
-    return {"backend": "autoremesher", "target_faces": target_faces, "quality": quality}
+    repaired_obj = temp_dir / "remeshed-repaired.obj"
+    repair_stats: dict[str, int] | None = None
+    try:
+        if progress:
+            progress("Converting the full source GLB to OBJ")
+        blender_export_obj(input_glb, source_obj, progress)
+        if progress:
+            progress("Instant Meshes: solving orientation and position fields")
+        run_process([
+            str(exe), "--output", str(result_obj), "--vertices", str(target_vertices),
+            "--boundaries", "--dominant", "--smooth", "0", str(source_obj),
+        ], progress=progress, timeout=3600)
+        if not result_obj.exists() or result_obj.stat().st_size < 64:
+            raise RuntimeError("Instant Meshes completed without writing remeshed.obj")
+        mesh_for_bake = result_obj
+        if repair_holes:
+            repair_stats = repair_meshfix(result_obj, repaired_obj, progress)
+            mesh_for_bake = repaired_obj
+        if progress:
+            progress("UV unwrapping and baking source textures onto the quad mesh")
+        blender_bake_retopology(input_glb, mesh_for_bake, output_glb, progress)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    return {
+        "backend": "instant-meshes",
+        "target_vertices": target_vertices,
+        "extrinsic": True,
+        "align_to_boundaries": True,
+        "texture_transfer": "blender-selected-to-active-bake",
+        "meshfix_repair": repair_stats,
+    }
+
+
+def run_trellis_ai_refine(input_glb: Path, source_image: Path, output_glb: Path, target_vertices: int, progress: Progress | None = None) -> dict[str, Any]:
+    """Image-guided geometry restoration followed by the existing quad export.
+
+    The FP8 TRELLIS.2 worker repairs/recreates image-supported geometry before
+    Instant Meshes sees it.  That avoids applying an unreliable hole filler to
+    a damaged quad mesh, while retaining the existing Blender texture transfer.
+    """
+    if not trellis_refiner_ready():
+        raise RuntimeError("AI Refine is not downloaded. Open Retopologize and download the TRELLIS.2 FP8 refiner first.")
+    exe = instant_meshes_exe()
+    if exe is None:
+        raise RuntimeError("Instant Meshes is required after AI Refine. Download it from Retopologize first.")
+    if find_blender() is None:
+        raise RuntimeError("Blender 4.2+ is required for texture baking")
+    temp_dir = output_glb.parent / f"trellis-refine-{output_glb.stem}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    refined_obj = temp_dir / "refined.obj"
+    remeshed_obj = temp_dir / "remeshed.obj"
+    try:
+        worker = ROOT / "backend" / "workers" / "trellis_refiner_worker.py"
+        spec = json.dumps({
+            "runtime": str(trellis_refiner_dir()), "input_glb": str(input_glb),
+            "source_image": str(source_image), "output_obj": str(refined_obj),
+        })
+        run_process([sys.executable, str(worker), spec], progress=progress, timeout=7200)
+        if progress:
+            progress("Instant Meshes: extracting the requested quad topology")
+        run_process([
+            str(exe), "--output", str(remeshed_obj), "--vertices", str(target_vertices),
+            "--boundaries", "--dominant", "--smooth", "0", str(refined_obj),
+        ], progress=progress, timeout=3600)
+        if not remeshed_obj.is_file() or remeshed_obj.stat().st_size < 64:
+            raise RuntimeError("Instant Meshes completed without writing the refined retopology")
+        if progress:
+            progress("Baking original GLB textures onto the AI-refined quad mesh")
+        blender_bake_retopology(input_glb, remeshed_obj, output_glb, progress)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    return {
+        "backend": "trellis2-fp8-ai-refine+instant-meshes",
+        "source_image_guided": True,
+        "model": "visualbruno/TRELLIS.2-4B-FP8",
+        "target_vertices": target_vertices,
+        "texture_transfer": "blender-selected-to-active-bake",
+    }
 
 
 def run_skintoken(input_glb: Path, output_glb: Path, progress: Progress | None = None) -> dict[str, Any]:
