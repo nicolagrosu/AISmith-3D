@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -223,6 +224,23 @@ def trellis_refiner_ready() -> bool:
     ))
 
 
+_CPP_FRAME_RE = re.compile(r"^[0-9A-Fa-f]{16}[0-9A-Fa-f\s<>]*\S+\.(?:dll|pyd|exe)!")
+
+
+def _format_failure_output(lines: list[str], limit: int = 8000) -> str:
+    """Preserve the Python traceback and root error instead of C++ DLL hex frames."""
+    filtered = [line for line in lines if not _CPP_FRAME_RE.match(line)]
+    active_lines = filtered if filtered else lines
+    tb_indices = [i for i, line in enumerate(active_lines) if line.startswith("Traceback (most recent call last):")]
+    if tb_indices:
+        tb_text = "\n".join(active_lines[tb_indices[-1]:]).strip()
+        if len(tb_text) <= limit:
+            return tb_text
+        return tb_text[:limit]
+    text = "\n".join(active_lines).strip()
+    return text[-limit:]
+
+
 def run_process(command: list[str], *, cwd: Path = ROOT, timeout: int = 3600, progress: Progress | None = None, env: dict[str, str] | None = None) -> str:
     if progress:
         progress(f"Launching {Path(command[0]).name}")
@@ -241,8 +259,9 @@ def run_process(command: list[str], *, cwd: Path = ROOT, timeout: int = 3600, pr
             if not line:
                 continue
             lines.append(line)
-            if progress:
-                progress(line[:500])
+            print(f"[{Path(command[0]).stem}] {line}", flush=True)
+            if progress and not _CPP_FRAME_RE.match(line):
+                progress(line[:2000])
 
     reader = threading.Thread(target=relay, name=f"aismith-{Path(command[0]).stem}-log", daemon=True)
     reader.start()
@@ -257,7 +276,8 @@ def run_process(command: list[str], *, cwd: Path = ROOT, timeout: int = 3600, pr
         _set_active_process(None)
     output = "\n".join(lines).strip()
     if return_code != 0:
-        raise RuntimeError(f"{Path(command[0]).name} failed ({return_code}): {output[-1800:]}")
+        formatted = _format_failure_output(lines)
+        raise RuntimeError(f"{Path(command[0]).name} failed ({return_code}):\n{formatted}")
     return output
 
 
@@ -321,6 +341,7 @@ def run_trellis(input_image: Path, output_glb: Path, resolution: int, seed: int 
             if not line:
                 continue
             log_lines.append(line)
+            print(f"[trellis-cpp] {line}", flush=True)
             if progress and ("[" in line and "/6]" in line):
                 progress(line)
 

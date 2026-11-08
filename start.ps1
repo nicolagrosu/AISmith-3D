@@ -61,7 +61,7 @@ if ($apiListener) {
 }
 
 Write-Host 'Starting AISmith 3D API on http://127.0.0.1:8000 ...' -ForegroundColor Cyan
-$api = Start-Process -WindowStyle Hidden -PassThru -FilePath $venvPython -ArgumentList '-m','uvicorn','backend.app.main:app','--host','127.0.0.1','--port','8000' -WorkingDirectory $root
+$api = Start-Process -NoNewWindow -PassThru -FilePath $venvPython -ArgumentList '-u','-m','uvicorn','backend.app.main:app','--host','127.0.0.1','--port','8000' -WorkingDirectory $root
 @{ pid = $api.Id } | ConvertTo-Json | Set-Content -LiteralPath $apiState -Encoding utf8
 Write-Host 'Starting AISmith 3D UI on http://127.0.0.1:5173 ...' -ForegroundColor Cyan
 npm.cmd --prefix frontend run dev -- --host 127.0.0.1

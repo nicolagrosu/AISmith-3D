@@ -428,11 +428,13 @@ def _run_trellis_refiner_download(state: DownloadState) -> None:
         models = runtime / "models"
         for index, repo in enumerate((
             "visualbruno/TRELLIS.2-4B-FP8",
-            "facebook/dinov3-vitl16-pretrain-lvd1689m",
         ), start=1):
-            state.file_name, state.file_index, state.file_count = repo, index, 2
-            _download_log(state, f"Downloading {repo}", 35 + index * 25)
+            state.file_name, state.file_index, state.file_count = repo, index, 1
+            _download_log(state, f"Downloading {repo}", 60)
             snapshot_download(repo_id=repo, local_dir=models / repo, local_dir_use_symlinks=False)
+        dino_dir = models / "facebook" / "dinov3-vitl16-pretrain-lvd1689m"
+        if not (dino_dir / "model.safetensors").is_file():
+            raise RuntimeError("The AISmith DINOv3 mirror is missing. Run AISmith-3D-Fixer again.")
         # The wrapper requires the sparse-structure decoder but not the full
         # 3-GB legacy TRELLIS-image-large repository.
         state.file_name, state.file_index, state.file_count = "TRELLIS-image-large decoder", 3, 3
@@ -461,7 +463,17 @@ def _job_log(job: JobState, message: str, progress: int | None = None) -> None:
     if progress is not None:
         job.progress = progress
     job.logs.append(message)
+    print(f"[job:{job.kind}:{job.id[:8]}] {message}", flush=True)
     _write_json(JOBS_DIR / f"{job.id}.json", job.as_dict())
+
+
+def _summarize_exception(exc: Exception) -> str:
+    text = str(exc).strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Warning):", line):
+            return f"Failed: {line}"
+    return f"Failed: {lines[0] if lines else text}"
 
 
 def _trellis_job_progress(message: str, current: int) -> int:
@@ -558,7 +570,11 @@ async def _execute_job(job: JobState, request: JobRequest) -> None:
             return
         job.status = "failed"
         job.error = str(exc)
-        _job_log(job, f"Failed: {exc}")
+        summary = _summarize_exception(exc)
+        job.logs.append(f"Failed: {exc}")
+        job.message = summary
+        print(f"[job:{job.kind}:{job.id[:8]}] Failed:\n{exc}", flush=True)
+        _write_json(JOBS_DIR / f"{job.id}.json", job.as_dict())
     finally:
         if model_name:
             await model_manager.release()

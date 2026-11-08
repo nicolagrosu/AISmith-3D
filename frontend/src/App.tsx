@@ -63,6 +63,8 @@ export default function App() {
   const [retopoElapsed, setRetopoElapsed] = useState(0)
   const [retopoTime, setRetopoTime] = useState<number | null>(null)
   const [retopoPendingPreview, setRetopoPendingPreview] = useState(false)
+  const [showLogs, setShowLogs] = useState(false)
+  const [copiedLogs, setCopiedLogs] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
   const modelFileRef = useRef<HTMLInputElement>(null)
   const refineImageRef = useRef<HTMLInputElement>(null)
@@ -76,6 +78,7 @@ export default function App() {
   useEffect(() => { const active = downloads.filter((item) => ['queued', 'running'].includes(item.status)); if (!active.length) return; const timer = window.setInterval(() => { Promise.all(active.map((item) => json<DownloadState>(`/downloads/${item.id}`))).then((fresh) => { setDownloads((current) => current.map((item) => fresh.find((next) => next.id === item.id) || item)); if (fresh.some((item) => item.status === 'completed')) refreshCaps() }).catch(() => undefined) }, 700); return () => window.clearInterval(timer) }, [downloads])
   useEffect(() => { if (!job || !['queued', 'running'].includes(job.status)) return; const timer = window.setInterval(() => json<Job>(`/jobs/${job.id}`).then(setJob).catch(() => undefined), 500); return () => window.clearInterval(timer) }, [job])
   useEffect(() => { if (job?.status === 'completed' && job.output_artifact_id) { json<Artifact>(`/assets/${job.output_artifact_id}/download`, { method: 'HEAD' }).catch(() => undefined); setOutput({ id: job.output_artifact_id, name: `${job.kind} result.glb`, kind: 'glb', size_bytes: 0 }) } }, [job?.status])
+  useEffect(() => { if (job?.status === 'failed') setShowLogs(true) }, [job?.id, job?.status])
   useEffect(() => { if (job?.kind === 'generate' && ['failed', 'cancelled'].includes(job?.status || '')) { setGenerationPendingPreview(false); setGenerationStartedAt(null) } }, [job?.kind, job?.status])
   useEffect(() => { if (!generationStartedAt || !generationPendingPreview) return; const timer = window.setInterval(() => setGenerationElapsed(Date.now() - generationStartedAt), 250); return () => window.clearInterval(timer) }, [generationStartedAt, generationPendingPreview])
   useEffect(() => { if (job?.kind === 'retopologize' && ['failed', 'cancelled'].includes(job?.status || '')) { setRefinePendingPreview(false); setRefineStartedAt(null) } }, [job?.kind, job?.status])
@@ -154,7 +157,25 @@ export default function App() {
         {error && <div className="error-box"><X size={14} />{error}</div>}
         {!error && tab !== 'generate' && caps?.diagnostics?.[0] && <div className="info-line"><Settings2 size={14} /> {caps.diagnostics[0]}</div>}
         <button className="primary-action" onClick={runJob} disabled={busy || !activeSource}>{busy ? <LoaderCircle className="spin" size={17} /> : <Play size={17} fill="currentColor" />}{busy ? 'Starting…' : tab === 'generate' ? 'Generate 3D asset' : `Run ${activeTab.label}`}</button>
-        {job && <div className={`job-status ${job.status}`}><div className="job-line"><Activity size={14} /><span>{job.message}</span><strong>{job.progress}%</strong></div><div className="job-track"><i style={{ width: `${job.progress}%` }} /></div>{job.warnings?.[0] && <small>{job.warnings[0]}</small>}</div>}
+        {job && <div className={`job-status ${job.status}`}>
+          <div className="job-line"><Activity size={14} /><span>{job.message}</span><strong>{job.progress}%</strong></div>
+          <div className="job-track"><i style={{ width: `${job.progress}%` }} /></div>
+          {job.warnings?.[0] && <small>{job.warnings[0]}</small>}
+          <div className="job-log-actions">
+            <button type="button" className="job-log-toggle" onClick={() => setShowLogs((prev) => !prev)}>
+              {showLogs ? 'Hide logs' : `Show logs (${job.logs?.length || 0})`}
+            </button>
+            <button type="button" className="job-log-toggle" onClick={() => {
+              const fullText = [job.error ? `ERROR:\n${job.error}` : '', job.logs?.length ? `LOGS:\n${job.logs.join('\n')}` : ''].filter(Boolean).join('\n\n')
+              navigator.clipboard?.writeText(fullText)
+              setCopiedLogs(true)
+              window.setTimeout(() => setCopiedLogs(false), 1500)
+            }}>
+              {copiedLogs ? 'Copied!' : 'Copy full log'}
+            </button>
+          </div>
+          {showLogs && <pre className="job-log-viewer">{[job.error ? `=== ERROR ===\n${job.error}` : '', job.logs?.length ? `=== LOGS (${job.logs.length}) ===\n${job.logs.join('\n')}` : 'No logs yet.'].filter(Boolean).join('\n\n')}</pre>}
+        </div>}
         </div>
       </aside>
       <section className="canvas-area"><StudioViewport artifactId={displayAsset?.id} artifactKind={displayAsset?.kind} artifactName={displayAsset?.name} onImportModel={() => modelFileRef.current?.click()} onModelLoaded={() => { if (generationPendingPreview && generationStartedAt) { const elapsed = Date.now() - generationStartedAt; setGenerationElapsed(elapsed); setGenerationTime(elapsed); setGenerationPendingPreview(false); setGenerationStartedAt(null) }; if (refinePendingPreview && refineStartedAt) { const elapsed = Date.now() - refineStartedAt; setRefineElapsed(elapsed); setRefineTime(elapsed); setRefinePendingPreview(false); setRefineStartedAt(null) }; if (retopoPendingPreview && retopoStartedAt) { const elapsed = Date.now() - retopoStartedAt; setRetopoElapsed(elapsed); setRetopoTime(elapsed); setRetopoPendingPreview(false); setRetopoStartedAt(null) } }} />{generationPendingPreview && <div className="generation-blocker"><div><Timer size={38} /><span>Generating 3D model</span><strong>{formatDuration(generationElapsed)}</strong><button className="secondary-button cancel-task" onClick={cancelTask}>Cancel task</button></div></div>}{refinePendingPreview && <div className="generation-blocker"><div><Timer size={38} /><span>Refining 3D model</span><strong>{formatDuration(refineElapsed)}</strong><button className="secondary-button cancel-task" onClick={cancelTask}>Cancel task</button></div></div>}{retopoPendingPreview && <div className="generation-blocker"><div><Timer size={38} /><span>Retopologizing 3D model</span><strong>{formatDuration(retopoElapsed)}</strong><button className="secondary-button cancel-task" onClick={cancelTask}>Cancel task</button></div></div>}<div className="canvas-footer"><div><span className="eyebrow">CURRENT OUTPUT</span><strong>{displayAsset ? displayAsset.name : 'No asset loaded'}</strong></div><div className="footer-actions">{generationTime !== null && <span className="generation-time">Generation time: {formatDuration(generationTime)}</span>}{refineTime !== null && <span className="generation-time">Refine time: {formatDuration(refineTime)}</span>}{retopoTime !== null && <span className="generation-time">Retopology time: {formatDuration(retopoTime)}</span>}{displayAsset && <><button className="secondary-button" onClick={openLocation}><FolderOpen size={14} /> Open location</button>{displayAsset.kind === 'glb' && <a className="download-button" href={`${API}/assets/${displayAsset.id}/download`}><Download size={14} /> Export GLB</a>}</>}</div></div></section>

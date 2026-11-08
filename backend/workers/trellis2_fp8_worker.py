@@ -13,6 +13,20 @@ import random
 import sys
 from pathlib import Path
 
+_WORKER_DIR = Path(__file__).resolve().parent
+if str(_WORKER_DIR) not in sys.path:
+    sys.path.insert(0, str(_WORKER_DIR))
+
+from turing_compat import (  # noqa: E402
+    apply_turing_compat,
+    needs_turing_compat,
+    patch_trellis2_windowed_attn,
+)
+
+
+def _has_flash_attn() -> bool:
+    return importlib.util.find_spec("flash_attn") is not None
+
 
 def _load_wrapper(wrapper_root: Path):
     init = wrapper_root / "__init__.py"
@@ -24,10 +38,13 @@ def _load_wrapper(wrapper_root: Path):
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    if needs_turing_compat() or not _has_flash_attn():
+        patch_trellis2_windowed_attn("aismith_trellis2")
     return sys.modules["aismith_trellis2.nodes"]
 
 
 def _load_nodes(runtime: Path):
+    apply_turing_compat()
     comfy = runtime / "ComfyUI"
     wrapper = comfy / "custom_nodes" / "ComfyUI-Trellis2"
     if not (comfy / "folder_paths.py").is_file() or not (wrapper / "nodes.py").is_file():
@@ -51,6 +68,18 @@ def _load_nodes(runtime: Path):
 
 
 def _load_pipeline(nodes, gpu_first: bool = False):
+    import torch
+
+    if gpu_first and torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        if vram_gb < 11.5:
+            print(
+                f"GPU has {vram_gb:.1f} GB VRAM; keeping low-VRAM model offloading enabled to avoid CUDA OOM",
+                flush=True,
+            )
+            gpu_first = False
+
+    sparse_backend = "sdpa" if (needs_turing_compat() or not _has_flash_attn()) else "flash_attn"
     print("Loading TRELLIS.2-4B FP8", flush=True)
     # Current ComfyUI-Trellis2 unconditionally copies a helper config into
     # this directory before it checks the FP8 option.  The config itself is
@@ -60,7 +89,7 @@ def _load_pipeline(nodes, gpu_first: bool = False):
     return nodes.Trellis2LoadModel().process(
         modelname="visualbruno/TRELLIS.2-4B-FP8", backend="sdpa", device="cuda",
         low_vram=not gpu_first, keep_models_loaded=gpu_first, conv_backend="flex_gemm",
-        sparse_backend="flash_attn", use_reconviagen=False,
+        sparse_backend=sparse_backend, use_reconviagen=False,
     )[0]
 
 
@@ -105,15 +134,79 @@ def _generate(nodes, pipeline, image, output: Path, resolution: int) -> None:
     _export(glb, output)
 
 
+def _cleanup_pipeline_vram(pipeline, exc: BaseException | None = None) -> None:
+    import gc
+    import traceback
+    import torch
+
+    if exc is not None and exc.__traceback__ is not None:
+        try:
+            traceback.clear_frames(exc.__traceback__)
+        except Exception:
+            pass
+
+    for unload_fn in (
+        "unload_shape_slat_decoder",
+        "unload_shape_slat_flow_model_1024",
+        "unload_shape_slat_flow_model_512",
+        "unload_shape_slat_encoder",
+        "unload_tex_slat_decoder",
+        "unload_tex_slat_flow_model_1024",
+        "unload_tex_slat_flow_model_512",
+        "unload_image_cond_model",
+        "unload_sparse_structure_model",
+    ):
+        fn = getattr(pipeline, unload_fn, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+    models = getattr(pipeline, "models", None)
+    if isinstance(models, dict):
+        for model in models.values():
+            if hasattr(model, "cpu"):
+                try:
+                    model.cpu()
+                except Exception:
+                    pass
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _refine(nodes, pipeline, image, input_mesh: Path, output: Path, resolution: int, target_faces: int, repair_holes: bool, safe_reconstruction: bool = False) -> None:
+    import torch
+
+    use_tiled_decoder = not needs_turing_compat()
     print("Loading source mesh", flush=True)
     source = nodes.Trellis2LoadMesh().load(str(input_mesh))[0]
-    print(f"Refining geometry at {resolution}", flush=True)
-    refined, _ = nodes.Trellis2MeshRefiner().process(
-        pipeline, source, image, random.randint(0, 0x7FFFFFFF), resolution,
-        12, 6.5, 0.05, 4.0, 1, 3.0, 0.20, 3.0, 49152, False, 16,
-        0.10, 1.0, 0.0, 0.90, True, 1, "euler", False, 0.0, 4, 1.0,
-    )
+    fallback_512 = False
+    try:
+        print(f"Refining geometry at {resolution}", flush=True)
+        refined, _ = nodes.Trellis2MeshRefiner().process(
+            pipeline, source, image, random.randint(0, 0x7FFFFFFF), resolution,
+            12, 6.5, 0.05, 4.0, 1, 3.0, 0.20, 3.0, 49152, False, 16,
+            0.10, 1.0, 0.0, 0.90, use_tiled_decoder, 1, "euler", False, 0.0, 4, 1.0,
+        )
+    except torch.cuda.OutOfMemoryError as exc:
+        if resolution <= 512:
+            raise
+        print("CUDA OOM at high resolution; cleaning VRAM and falling back to 512 refinement resolution", flush=True)
+        _cleanup_pipeline_vram(pipeline, exc)
+        fallback_512 = True
+
+    if fallback_512:
+        _cleanup_pipeline_vram(pipeline)
+        resolution = 512
+        refined, _ = nodes.Trellis2MeshRefiner().process(
+            pipeline, source, image, random.randint(0, 0x7FFFFFFF), resolution,
+            12, 6.5, 0.05, 4.0, 1, 3.0, 0.20, 3.0, 49152, False, 16,
+            0.10, 1.0, 0.0, 0.90, use_tiled_decoder, 1, "euler", False, 0.0, 4, 1.0,
+        )
+
     if safe_reconstruction:
         print("Reconstructing compatible CuMesh surface", flush=True)
         rebuilt = nodes.Trellis2ReconstructMesh().process(refined, 1.0, 512)[0]
@@ -122,8 +215,10 @@ def _refine(nodes, pipeline, image, input_mesh: Path, output: Path, resolution: 
         rebuilt = nodes.Trellis2ReconstructMeshWithQuad().process(
             refined, 1.0, resolution, True, True
         )[0]
-    print(f"Simplifying reconstructed mesh to {target_faces:,} faces", flush=True)
-    rebuilt = nodes.Trellis2SimplifyMesh().process(rebuilt, target_faces, "Cumesh")[0]
+    simplify_method = "Cumesh"
+
+    print(f"Simplifying reconstructed mesh to {target_faces:,} faces ({simplify_method})", flush=True)
+    rebuilt = nodes.Trellis2SimplifyMesh().process(rebuilt, target_faces, simplify_method)[0]
     if repair_holes:
         print("Filling holes with Meshlib", flush=True)
         rebuilt = nodes.Trellis2FillHolesNicelyWithMeshlib().process(rebuilt)[0]

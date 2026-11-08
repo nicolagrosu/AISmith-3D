@@ -4,6 +4,10 @@ AISmith 3D is a Windows-local studio for taking a reference image through 3D gen
 
 > Hackathon note: this repository contains the application and its source dependencies, but **does not include any model weights**. Use the in-app download controls after startup.
 
+## Recent Improvements (RTX 20-Series & 6 GB VRAM Support)
+
+The **Refine** pipeline originally required newer RTX 30/40-series GPUs and high VRAM, causing crashes, multi-hour runtimes, out-of-memory errors, and surface holes/bridging artifacts on cards like the **NVIDIA RTX 2060 (6 GB VRAM)**. It has now been updated with compatible GPU fallbacks for older CUDA architectures, hardware-accelerated `float16` execution and pre-clustered UV unwrapping (cutting refinement time from 3+ hours down to ~4 minutes), automatic CPU offloading and cache cleanup to fit 1024-resolution refinement within 6 GB VRAM, watertight surface reconstruction to eliminate mesh holes and stray bridging geometry, and full live log/error visibility in both the console and the web UI.
+
 ## What it does
 
 | Workflow | Result | Prerequisites |
